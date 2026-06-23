@@ -89,3 +89,12 @@ MB_HELPER_VERBOSE_INPUT=1 ./.build/debug/mousebridge-helper run --data-dir ~/.mo
 ```
 
 它适合开发验证，不代表最终产品运行方式。
+
+如果已经有一对本地 daemon/helper 在运行，也可以在 `core` 里直接跑一段远端动作脚本：
+
+```bash
+cd ../core
+./verify/local-session-smoke.sh http://127.0.0.1:39273 http://127.0.0.1:39272 "MouseBridge smoke"
+```
+
+它会尝试走真实 session 链路，把 move + click + text 注入到接收端 helper。

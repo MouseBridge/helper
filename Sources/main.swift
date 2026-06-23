@@ -36,6 +36,7 @@ struct InputPayload: Codable {
     let dy: Double?
     let key_code: Int64?
     let modifiers: Int64?
+    let text: String?
     let button: String?
     let pressed: Bool?
 }
@@ -192,6 +193,8 @@ final class CaptureSuppressionState: @unchecked Sendable {
             suppressScrollUntil = max(suppressScrollUntil, now.addingTimeInterval(0.05))
         case "key_down", "key_up", "key_tap":
             suppressKeysUntil = max(suppressKeysUntil, now.addingTimeInterval(0.035))
+        case "text":
+            suppressKeysUntil = max(suppressKeysUntil, now.addingTimeInterval(0.035))
         default:
             break
         }
@@ -343,6 +346,7 @@ final class MouseMoveCoalescer: @unchecked Sendable {
             dy: pendingDY,
             key_code: nil,
             modifiers: nil,
+            text: nil,
             button: pendingButton.isEmpty ? nil : pendingButton,
             pressed: nil
         )
@@ -831,48 +835,48 @@ final class EventTapRunner {
             return nil
         case .leftMouseDown:
             moveCoalescer.flush()
-            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, key_code: nil, modifiers: nil, button: "left", pressed: true))
+            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, key_code: nil, modifiers: nil, text: nil, button: "left", pressed: true))
             return nil
         case .leftMouseUp:
             moveCoalescer.flush()
-            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, key_code: nil, modifiers: nil, button: "left", pressed: false))
+            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, key_code: nil, modifiers: nil, text: nil, button: "left", pressed: false))
             return nil
         case .rightMouseDown:
             moveCoalescer.flush()
-            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, key_code: nil, modifiers: nil, button: "right", pressed: true))
+            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, key_code: nil, modifiers: nil, text: nil, button: "right", pressed: true))
             return nil
         case .rightMouseUp:
             moveCoalescer.flush()
-            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, key_code: nil, modifiers: nil, button: "right", pressed: false))
+            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, key_code: nil, modifiers: nil, text: nil, button: "right", pressed: false))
             return nil
         case .otherMouseDown:
             moveCoalescer.flush()
-            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, key_code: nil, modifiers: nil, button: buttonName(for: type, event: event), pressed: true))
+            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, key_code: nil, modifiers: nil, text: nil, button: buttonName(for: type, event: event), pressed: true))
             return nil
         case .otherMouseUp:
             moveCoalescer.flush()
-            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, key_code: nil, modifiers: nil, button: buttonName(for: type, event: event), pressed: false))
+            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, key_code: nil, modifiers: nil, text: nil, button: buttonName(for: type, event: event), pressed: false))
             return nil
         case .scrollWheel:
             moveCoalescer.flush()
             let dy = Double(event.getIntegerValueField(.scrollWheelEventDeltaAxis1))
             let dx = Double(event.getIntegerValueField(.scrollWheelEventDeltaAxis2))
-            client.sendInput(InputPayload(kind: "scroll", dx: dx, dy: dy, key_code: nil, modifiers: nil, button: nil, pressed: nil))
+            client.sendInput(InputPayload(kind: "scroll", dx: dx, dy: dy, key_code: nil, modifiers: nil, text: nil, button: nil, pressed: nil))
             return nil
         case .flagsChanged:
             moveCoalescer.flush()
             guard let isDown = modifierState.transition(for: keyCode, flags: event.flags) else {
                 return nil
             }
-            client.sendInput(InputPayload(kind: isDown ? "key_down" : "key_up", dx: nil, dy: nil, key_code: Int64(keyCode), modifiers: Int64(event.flags.rawValue), button: nil, pressed: nil))
+            client.sendInput(InputPayload(kind: isDown ? "key_down" : "key_up", dx: nil, dy: nil, key_code: Int64(keyCode), modifiers: Int64(event.flags.rawValue), text: nil, button: nil, pressed: nil))
             return nil
         case .keyDown:
             moveCoalescer.flush()
-            client.sendInput(InputPayload(kind: "key_down", dx: nil, dy: nil, key_code: Int64(keyCode), modifiers: Int64(event.flags.rawValue), button: nil, pressed: nil))
+            client.sendInput(InputPayload(kind: "key_down", dx: nil, dy: nil, key_code: Int64(keyCode), modifiers: Int64(event.flags.rawValue), text: nil, button: nil, pressed: nil))
             return nil
         case .keyUp:
             moveCoalescer.flush()
-            client.sendInput(InputPayload(kind: "key_up", dx: nil, dy: nil, key_code: Int64(keyCode), modifiers: Int64(event.flags.rawValue), button: nil, pressed: nil))
+            client.sendInput(InputPayload(kind: "key_up", dx: nil, dy: nil, key_code: Int64(keyCode), modifiers: Int64(event.flags.rawValue), text: nil, button: nil, pressed: nil))
             return nil
         default:
             break
@@ -1036,6 +1040,8 @@ enum InputInjector {
             try injectKeyEvent(kind: "key_down", keyCode: input.key_code ?? 0, modifiers: input.modifiers ?? 0)
         case "key_up":
             try injectKeyEvent(kind: "key_up", keyCode: input.key_code ?? 0, modifiers: input.modifiers ?? 0)
+        case "text":
+            try injectText(input.text ?? "")
         default:
             throw HelperError.unsupportedInput(input.kind)
         }
@@ -1080,6 +1086,24 @@ enum InputInjector {
         try injectKeyEvent(kind: "key_down", keyCode: keyCode, modifiers: modifiers)
         try injectKeyEvent(kind: "key_up", keyCode: keyCode, modifiers: modifiers)
         Logger.input("injected key_tap key_code=\(keyCode) modifiers=\(modifiers)")
+    }
+
+    private static func injectText(_ text: String) throws {
+        for character in text {
+            let units = Array(String(character).utf16)
+            guard let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
+                  let keyUp = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
+                throw HelperError.unsupportedInput("text")
+            }
+            var mutableUnits = units
+            keyDown.keyboardSetUnicodeString(stringLength: mutableUnits.count, unicodeString: &mutableUnits)
+            keyUp.keyboardSetUnicodeString(stringLength: mutableUnits.count, unicodeString: &mutableUnits)
+            markSynthetic(keyDown)
+            markSynthetic(keyUp)
+            keyDown.post(tap: .cghidEventTap)
+            keyUp.post(tap: .cghidEventTap)
+        }
+        Logger.input("injected text len=\(text.count)")
     }
 
     private static func injectKeyEvent(kind: String, keyCode: Int64, modifiers: Int64) throws {
