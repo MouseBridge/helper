@@ -1,41 +1,91 @@
 # MouseBridge Helper
 
-`mousebridge-helper` is the macOS-side input helper for MouseBridge.
+`mousebridge-helper` 是 MouseBridge 的 macOS 原生侧输入组件。
 
-It is responsible for:
+它负责：
 
-- capturing local keyboard and mouse input via `CGEventTap`
-- reporting hotkeys and edge-switch hits back to the daemon
-- injecting remote mouse and keyboard input into macOS
+- 用 `CGEventTap` 捕获本机键盘鼠标
+- 上报热键、边缘切换、输入事件给 daemon
+- 把远端输入注入到当前 macOS 会话
 
-## Build
+## 构建
 
 ```bash
 cd helper
 swift build
 ```
 
-## Run
-
-Start the matching daemon first, then launch the helper with the same `data-dir`:
+## 直接运行
 
 ```bash
-./.build/debug/mousebridge-helper --data-dir /path/to/runtime-data-b
+./.build/debug/mousebridge-helper run --data-dir ~/.mousebridge
 ```
 
-The helper reads `config.json` from that data directory and connects to the daemon's local Unix socket.
+兼容旧形式：
 
-## Requirements
+```bash
+./.build/debug/mousebridge-helper --data-dir ~/.mousebridge
+```
 
-- macOS 13+
-- Accessibility permission for the terminal or app launching the helper
+## LaunchAgent 托管
 
-## Typical Local Verification
+推荐把 helper 装成 LaunchAgent，而不是长期依赖终端手工拉起。
 
-From the repository root:
+安装：
+
+```bash
+./.build/debug/mousebridge-helper install-launch-agent --data-dir ~/.mousebridge
+```
+
+卸载：
+
+```bash
+./.build/debug/mousebridge-helper uninstall-launch-agent --data-dir ~/.mousebridge
+```
+
+查看将要写入的 plist：
+
+```bash
+./.build/debug/mousebridge-helper print-launch-agent --data-dir ~/.mousebridge
+```
+
+LaunchAgent 默认配置：
+
+- `RunAtLoad = true`
+- `KeepAlive = true`
+- 会话类型限制为 `Aqua`
+- 日志写到 `<data-dir>/logs/`
+
+## 权限引导
+
+检查是否已有 Accessibility 权限：
+
+```bash
+./.build/debug/mousebridge-helper check-accessibility
+```
+
+打开系统设置到 Accessibility 页面：
+
+```bash
+./.build/debug/mousebridge-helper open-accessibility
+```
+
+## 调试
+
+默认关闭高频输入日志。
+
+如需排查输入环路或注入问题：
+
+```bash
+MB_HELPER_VERBOSE_INPUT=1 ./.build/debug/mousebridge-helper run --data-dir ~/.mousebridge
+```
+
+## 本地验证
+
+仓库根目录仍保留了本机双端验证脚本：
 
 ```bash
 ./verify/local-two-node-macos.sh start
 ```
 
-This launches two local daemons plus two helpers for sender/receiver testing on one machine.
+它适合开发验证，不代表最终产品运行方式。

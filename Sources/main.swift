@@ -383,10 +383,17 @@ enum ScreenEdgeDetector {
 }
 
 enum Logger {
+    private static let verboseInput = ProcessInfo.processInfo.environment["MB_HELPER_VERBOSE_INPUT"] == "1"
+
     static func log(_ message: String) {
         let formatter = ISO8601DateFormatter()
         let timestamp = formatter.string(from: Date())
         FileHandle.standardError.write(Data("[helper] \(timestamp) \(message)\n".utf8))
+    }
+
+    static func input(_ message: String) {
+        guard verboseInput else { return }
+        log(message)
     }
 }
 
@@ -627,7 +634,7 @@ final class SocketClient: @unchecked Sendable {
     func sendInput(_ payload: InputPayload) {
         do {
             try send(type: "input", payload: payload)
-            Logger.log("sent input kind=\(payload.kind)")
+            Logger.input("sent input kind=\(payload.kind)")
         } catch {
             Logger.log("send input failed: \(error)")
         }
@@ -918,6 +925,8 @@ enum HelperError: Error, CustomStringConvertible {
     case accessibilityNotGranted
     case eventTapCreateFailed
     case unsupportedInput(String)
+    case invalidArguments(String)
+    case commandFailed(String)
 
     var description: String {
         switch self {
@@ -935,6 +944,10 @@ enum HelperError: Error, CustomStringConvertible {
             return "failed to create CGEventTap"
         case .unsupportedInput(let kind):
             return "unsupported input kind \(kind)"
+        case .invalidArguments(let message):
+            return "invalid arguments: \(message)"
+        case .commandFailed(let message):
+            return message
         }
     }
 }
@@ -1038,7 +1051,7 @@ enum InputInjector {
         }
         markSynthetic(event)
         event.post(tap: .cghidEventTap)
-        Logger.log("injected mouse_move dx=\(dx) dy=\(dy) button=\(normalizedButton(button)) from=(\(location.x),\(location.y)) to=(\(next.x),\(next.y))")
+        Logger.input("injected mouse_move dx=\(dx) dy=\(dy) button=\(normalizedButton(button)) from=(\(location.x),\(location.y)) to=(\(next.x),\(next.y))")
     }
 
     private static func injectMouseButton(button: String, pressed: Bool) throws {
@@ -1051,7 +1064,7 @@ enum InputInjector {
         }
         markSynthetic(event)
         event.post(tap: .cghidEventTap)
-        Logger.log("injected mouse_button button=\(button) pressed=\(pressed)")
+        Logger.input("injected mouse_button button=\(button) pressed=\(pressed)")
     }
 
     private static func injectScroll(dx: Double, dy: Double) throws {
@@ -1060,13 +1073,13 @@ enum InputInjector {
         }
         markSynthetic(event)
         event.post(tap: .cghidEventTap)
-        Logger.log("injected scroll dx=\(dx) dy=\(dy)")
+        Logger.input("injected scroll dx=\(dx) dy=\(dy)")
     }
 
     private static func injectKeyTap(keyCode: Int64, modifiers: Int64) throws {
         try injectKeyEvent(kind: "key_down", keyCode: keyCode, modifiers: modifiers)
         try injectKeyEvent(kind: "key_up", keyCode: keyCode, modifiers: modifiers)
-        Logger.log("injected key_tap key_code=\(keyCode) modifiers=\(modifiers)")
+        Logger.input("injected key_tap key_code=\(keyCode) modifiers=\(modifiers)")
     }
 
     private static func injectKeyEvent(kind: String, keyCode: Int64, modifiers: Int64) throws {
@@ -1089,7 +1102,7 @@ enum InputInjector {
         event.flags = flags
         markSynthetic(event)
         event.post(tap: .cghidEventTap)
-        Logger.log("injected \(kind) key_code=\(keyCode) modifiers=\(modifiers)")
+        Logger.input("injected \(kind) key_code=\(keyCode) modifiers=\(modifiers)")
     }
 
     private static func mouseMoveType(button: String?) -> CGEventType {
@@ -1155,8 +1168,17 @@ enum InputInjector {
     }
 }
 
-func main() throws {
-    let dataDir = parseDataDir()
+enum HelperCommand {
+    case run(dataDir: String)
+    case printLaunchAgent(dataDir: String, label: String, program: String)
+    case installLaunchAgent(dataDir: String, label: String, program: String)
+    case uninstallLaunchAgent(label: String)
+    case openAccessibility
+    case checkAccessibility
+    case help
+}
+
+func runHelper(dataDir: String) throws {
     let configPath = URL(fileURLWithPath: dataDir).appendingPathComponent("config.json").path
     let config = try loadConfig(path: configPath)
     let socketPath = helperSocketPath(dataDir: dataDir, port: config.port)
@@ -1177,14 +1199,223 @@ func main() throws {
     CFRunLoopRun()
 }
 
-func parseDataDir() -> String {
-    let args = CommandLine.arguments
-    if let index = args.firstIndex(of: "--data-dir"), index + 1 < args.count {
-        return args[index + 1]
+func parseCommand() throws -> HelperCommand {
+    let args = Array(CommandLine.arguments.dropFirst())
+    if args.isEmpty || args.first?.hasPrefix("--") == true {
+        return .run(dataDir: try parseDataDir(from: args))
     }
 
+    switch args[0] {
+    case "run":
+        return .run(dataDir: try parseDataDir(from: Array(args.dropFirst())))
+    case "print-launch-agent":
+        let tail = Array(args.dropFirst())
+        let dataDir = try parseDataDir(from: tail)
+        return .printLaunchAgent(
+            dataDir: dataDir,
+            label: parseLabel(from: tail, dataDir: dataDir),
+            program: try parseProgramPath(from: tail)
+        )
+    case "install-launch-agent":
+        let tail = Array(args.dropFirst())
+        let dataDir = try parseDataDir(from: tail)
+        return .installLaunchAgent(
+            dataDir: dataDir,
+            label: parseLabel(from: tail, dataDir: dataDir),
+            program: try parseProgramPath(from: tail)
+        )
+    case "uninstall-launch-agent":
+        let tail = Array(args.dropFirst())
+        let dataDir = try parseDataDir(from: tail)
+        return .uninstallLaunchAgent(label: parseLabel(from: tail, dataDir: dataDir))
+    case "open-accessibility":
+        return .openAccessibility
+    case "check-accessibility":
+        return .checkAccessibility
+    case "help", "--help", "-h":
+        return .help
+    default:
+        throw HelperError.invalidArguments("unknown command \(args[0])")
+    }
+}
+
+func parseDataDir(from args: [String]) throws -> String {
+    if let index = args.firstIndex(of: "--data-dir") {
+        guard index + 1 < args.count else {
+            throw HelperError.invalidArguments("missing value for --data-dir")
+        }
+        return resolvePath(args[index + 1])
+    }
     let home = FileManager.default.homeDirectoryForCurrentUser.path
     return "\(home)/.mousebridge"
+}
+
+func parseLabel(from args: [String], dataDir: String) -> String {
+    if let index = args.firstIndex(of: "--label"), index + 1 < args.count {
+        return args[index + 1]
+    }
+    return defaultLaunchAgentLabel(dataDir: dataDir)
+}
+
+func parseProgramPath(from args: [String]) throws -> String {
+    if let index = args.firstIndex(of: "--program") {
+        guard index + 1 < args.count else {
+            throw HelperError.invalidArguments("missing value for --program")
+        }
+        return resolvePath(args[index + 1])
+    }
+    return try currentExecutablePath()
+}
+
+func resolvePath(_ value: String) -> String {
+    if value.hasPrefix("/") {
+        return URL(fileURLWithPath: value).standardizedFileURL.path
+    }
+    return URL(fileURLWithPath: value, relativeTo: URL(fileURLWithPath: FileManager.default.currentDirectoryPath)).standardizedFileURL.path
+}
+
+func currentExecutablePath() throws -> String {
+    guard let executable = Bundle.main.executablePath ?? ProcessInfo.processInfo.arguments.first else {
+        throw HelperError.invalidArguments("unable to determine helper executable path")
+    }
+    return resolvePath(executable)
+}
+
+func defaultLaunchAgentLabel(dataDir: String) -> String {
+    let digest = SHA256.hash(data: Data(dataDir.utf8))
+    let suffix = digest.prefix(4).map { String(format: "%02x", $0) }.joined()
+    return "com.mousebridge.helper.\(suffix)"
+}
+
+func launchAgentPlistPath(label: String) -> String {
+    let home = FileManager.default.homeDirectoryForCurrentUser.path
+    return "\(home)/Library/LaunchAgents/\(label).plist"
+}
+
+func helperLogPath(dataDir: String, fileName: String) -> String {
+    return URL(fileURLWithPath: dataDir).appendingPathComponent("logs").appendingPathComponent(fileName).path
+}
+
+func xmlEscaped(_ value: String) -> String {
+    value
+        .replacingOccurrences(of: "&", with: "&amp;")
+        .replacingOccurrences(of: "<", with: "&lt;")
+        .replacingOccurrences(of: ">", with: "&gt;")
+        .replacingOccurrences(of: "\"", with: "&quot;")
+        .replacingOccurrences(of: "'", with: "&apos;")
+}
+
+func launchAgentPlist(label: String, program: String, dataDir: String) -> String {
+    let workingDirectory = URL(fileURLWithPath: program).deletingLastPathComponent().path
+    let stdoutPath = helperLogPath(dataDir: dataDir, fileName: "helper.stdout.log")
+    let stderrPath = helperLogPath(dataDir: dataDir, fileName: "helper.stderr.log")
+    return """
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0">
+    <dict>
+      <key>Label</key>
+      <string>\(xmlEscaped(label))</string>
+      <key>LimitLoadToSessionType</key>
+      <array>
+        <string>Aqua</string>
+      </array>
+      <key>ProgramArguments</key>
+      <array>
+        <string>\(xmlEscaped(program))</string>
+        <string>run</string>
+        <string>--data-dir</string>
+        <string>\(xmlEscaped(dataDir))</string>
+      </array>
+      <key>RunAtLoad</key>
+      <true/>
+      <key>KeepAlive</key>
+      <true/>
+      <key>ProcessType</key>
+      <string>Interactive</string>
+      <key>WorkingDirectory</key>
+      <string>\(xmlEscaped(workingDirectory))</string>
+      <key>StandardOutPath</key>
+      <string>\(xmlEscaped(stdoutPath))</string>
+      <key>StandardErrorPath</key>
+      <string>\(xmlEscaped(stderrPath))</string>
+    </dict>
+    </plist>
+    """
+}
+
+@discardableResult
+func runCommand(_ launchPath: String, _ arguments: [String], allowFailure: Bool = false) throws -> String {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: launchPath)
+    process.arguments = arguments
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = pipe
+    try process.run()
+    process.waitUntilExit()
+    let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    if process.terminationStatus != 0 && !allowFailure {
+        throw HelperError.commandFailed("\(launchPath) \(arguments.joined(separator: " ")): \(output.trimmingCharacters(in: .whitespacesAndNewlines))")
+    }
+    return output
+}
+
+func installLaunchAgent(label: String, program: String, dataDir: String) throws {
+    let plistPath = launchAgentPlistPath(label: label)
+    let fileManager = FileManager.default
+    try fileManager.createDirectory(atPath: URL(fileURLWithPath: plistPath).deletingLastPathComponent().path, withIntermediateDirectories: true)
+    try fileManager.createDirectory(atPath: URL(fileURLWithPath: helperLogPath(dataDir: dataDir, fileName: "helper.stderr.log")).deletingLastPathComponent().path, withIntermediateDirectories: true)
+    try launchAgentPlist(label: label, program: program, dataDir: dataDir).write(toFile: plistPath, atomically: true, encoding: .utf8)
+
+    let domain = "gui/\(getuid())"
+    _ = try runCommand("/bin/launchctl", ["bootout", domain, plistPath], allowFailure: true)
+    try runCommand("/bin/launchctl", ["bootstrap", domain, plistPath])
+    _ = try runCommand("/bin/launchctl", ["enable", "\(domain)/\(label)"], allowFailure: true)
+    try runCommand("/bin/launchctl", ["kickstart", "-k", "\(domain)/\(label)"])
+
+    print("installed LaunchAgent \(label)")
+    print("plist: \(plistPath)")
+    print("logs: \(URL(fileURLWithPath: helperLogPath(dataDir: dataDir, fileName: "helper.stderr.log")).deletingLastPathComponent().path)")
+}
+
+func uninstallLaunchAgent(label: String) throws {
+    let plistPath = launchAgentPlistPath(label: label)
+    let domain = "gui/\(getuid())"
+    _ = try runCommand("/bin/launchctl", ["bootout", domain, plistPath], allowFailure: true)
+    if FileManager.default.fileExists(atPath: plistPath) {
+        try FileManager.default.removeItem(atPath: plistPath)
+    }
+    print("uninstalled LaunchAgent \(label)")
+}
+
+func openAccessibilitySettings() throws {
+    guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") else {
+        throw HelperError.invalidArguments("failed to build Accessibility settings URL")
+    }
+    if !NSWorkspace.shared.open(url) {
+        throw HelperError.commandFailed("failed to open Accessibility settings")
+    }
+}
+
+func printUsage() {
+    print("""
+    MouseBridge Helper
+
+    Usage:
+      mousebridge-helper run [--data-dir DIR]
+      mousebridge-helper --data-dir DIR
+      mousebridge-helper print-launch-agent [--data-dir DIR] [--label LABEL] [--program PATH]
+      mousebridge-helper install-launch-agent [--data-dir DIR] [--label LABEL] [--program PATH]
+      mousebridge-helper uninstall-launch-agent [--data-dir DIR] [--label LABEL]
+      mousebridge-helper check-accessibility
+      mousebridge-helper open-accessibility
+
+    Notes:
+      - install-launch-agent creates a per-data-dir LaunchAgent with RunAtLoad + KeepAlive.
+      - open-accessibility opens the macOS Accessibility settings pane.
+      - set MB_HELPER_VERBOSE_INPUT=1 to enable per-input helper logs.
+    """)
 }
 
 func loadConfig(path: String) throws -> ConfigFile {
@@ -1201,7 +1432,27 @@ func helperSocketPath(dataDir: String, port: Int) -> String {
 }
 
 do {
-    try main()
+    switch try parseCommand() {
+    case .run(let dataDir):
+        try runHelper(dataDir: dataDir)
+    case .printLaunchAgent(let dataDir, let label, let program):
+        print(launchAgentPlist(label: label, program: program, dataDir: dataDir))
+    case .installLaunchAgent(let dataDir, let label, let program):
+        try installLaunchAgent(label: label, program: program, dataDir: dataDir)
+    case .uninstallLaunchAgent(let label):
+        try uninstallLaunchAgent(label: label)
+    case .openAccessibility:
+        try openAccessibilitySettings()
+    case .checkAccessibility:
+        if AXIsProcessTrusted() {
+            print("Accessibility permission: granted")
+        } else {
+            print("Accessibility permission: not granted")
+            exit(1)
+        }
+    case .help:
+        printUsage()
+    }
 } catch {
     Logger.log("fatal: \(error)")
     exit(1)
