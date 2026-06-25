@@ -80,6 +80,8 @@ LaunchAgent 默认配置：
 MB_HELPER_VERBOSE_INPUT=1 ./.build/debug/mousebridge-helper run --data-dir ~/.mousebridge
 ```
 
+接收端连续 `mouse_move` 现在也会在 helper 内部做一次短窗口 coalescing，减少高频注入开销；打开 `MB_HELPER_VERBOSE_INPUT=1` 时会看到 `coalesced incoming mouse_move ...` 日志。
+
 ## 本地验证
 
 仓库根目录仍保留了本机双端验证脚本：

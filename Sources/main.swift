@@ -366,6 +366,79 @@ final class MouseMoveCoalescer: @unchecked Sendable {
     }
 }
 
+final class IncomingMouseMoveCoalescer: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "mousebridge.helper.incoming-mousemove")
+    private let flushInterval: TimeInterval = 1.0 / 240.0
+    private let inject: (InputPayload) throws -> Void
+    private var timer: DispatchSourceTimer?
+    private var pendingDX: Double = 0
+    private var pendingDY: Double = 0
+    private var pendingButton = ""
+    private var pendingCount = 0
+
+    init(inject: @escaping (InputPayload) throws -> Void) {
+        self.inject = inject
+    }
+
+    func enqueue(_ input: InputPayload) {
+        queue.async {
+            let normalizedButton = input.button ?? ""
+            if !self.pendingButton.isEmpty && self.pendingButton != normalizedButton {
+                self.flushLocked()
+            }
+            self.pendingDX += input.dx ?? 0
+            self.pendingDY += input.dy ?? 0
+            self.pendingButton = normalizedButton
+            self.pendingCount += 1
+            self.ensureTimerLocked()
+        }
+    }
+
+    func flush() {
+        queue.sync {
+            self.flushLocked()
+        }
+    }
+
+    private func ensureTimerLocked() {
+        guard timer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + flushInterval, repeating: flushInterval)
+        timer.setEventHandler { [weak self] in
+            self?.flushLocked()
+        }
+        self.timer = timer
+        timer.resume()
+    }
+
+    private func flushLocked() {
+        guard pendingDX != 0 || pendingDY != 0 else { return }
+        let payload = InputPayload(
+            kind: "mouse_move",
+            dx: pendingDX,
+            dy: pendingDY,
+            key_code: nil,
+            modifiers: nil,
+            text: nil,
+            button: pendingButton.isEmpty ? nil : pendingButton,
+            pressed: nil
+        )
+        let coalescedCount = pendingCount
+        pendingDX = 0
+        pendingDY = 0
+        pendingButton = ""
+        pendingCount = 0
+        do {
+            try inject(payload)
+            if coalescedCount > 1 {
+                Logger.input("coalesced incoming mouse_move count=\(coalescedCount) dx=\(payload.dx ?? 0) dy=\(payload.dy ?? 0) button=\(payload.button ?? "")")
+            }
+        } catch {
+            Logger.log("incoming mouse_move inject failed: \(error)")
+        }
+    }
+}
+
 enum ScreenEdgeDetector {
     private static let threshold: CGFloat = 2.0
 
@@ -555,6 +628,7 @@ final class SocketClient: @unchecked Sendable {
     private let state: HelperState
     private let readQueue = DispatchQueue(label: "mousebridge.helper.socket")
     private let writeQueue = DispatchQueue(label: "mousebridge.helper.socket.write")
+    private let incomingMoveCoalescer = IncomingMouseMoveCoalescer(inject: InputInjector.inject)
 
     init(socketPath: String, registry: HotkeyRegistry, state: HelperState) throws {
         let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
@@ -612,6 +686,7 @@ final class SocketClient: @unchecked Sendable {
             while true {
                 let count = Darwin.read(fileHandle.fileDescriptor, &chunk, chunkSize)
                 if count <= 0 {
+                    incomingMoveCoalescer.flush()
                     Logger.log("socket closed")
                     return
                 }
@@ -680,7 +755,7 @@ final class SocketClient: @unchecked Sendable {
                 if let payload = root["payload"] {
                     let payloadData = try JSONSerialization.data(withJSONObject: payload)
                     let input = try decoder.decode(InputPayload.self, from: payloadData)
-                    try InputInjector.inject(input)
+                    handleIncomingInput(input)
                 }
             case "error":
                 Logger.log("daemon protocol error")
@@ -689,6 +764,19 @@ final class SocketClient: @unchecked Sendable {
             }
         } catch {
             Logger.log("decode failed: \(error)")
+        }
+    }
+
+    private func handleIncomingInput(_ input: InputPayload) {
+        if input.kind == "mouse_move" {
+            incomingMoveCoalescer.enqueue(input)
+            return
+        }
+        incomingMoveCoalescer.flush()
+        do {
+            try InputInjector.inject(input)
+        } catch {
+            Logger.log("inject failed: \(error)")
         }
     }
 
