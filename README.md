@@ -98,3 +98,4 @@ cd ../core
 ```
 
 它会尝试走真实 session 链路，把 move + click + text 注入到接收端 helper。
+为了减少同机双 helper 噪声，脚本会在验证期间临时关闭两侧本机捕获，结束后自动恢复。

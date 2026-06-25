@@ -65,6 +65,7 @@ struct ConfigPushPayload: Decodable {
     let edge_targets: [String: String]
     let active_target: String
     let paused: Bool
+    let capture_enabled: Bool
 }
 
 struct ParsedHotkey {
@@ -83,6 +84,7 @@ final class HelperState: @unchecked Sendable {
     private var daemonDeviceID = ""
     private var activeTarget = ""
     private var paused = false
+    private var captureEnabled = true
     private var edgeTargets: [String: String] = [:]
     private var requireEdgeNeutral = false
     private var suppressEdgesUntil = Date.distantPast
@@ -93,6 +95,7 @@ final class HelperState: @unchecked Sendable {
         daemonDeviceID = payload.daemon.device_id
         activeTarget = payload.active_target
         paused = payload.paused
+        captureEnabled = payload.capture_enabled
         edgeTargets = payload.edge_targets
         if !daemonDeviceID.isEmpty && previousTarget != daemonDeviceID && activeTarget == daemonDeviceID {
             requireEdgeNeutral = true
@@ -104,13 +107,13 @@ final class HelperState: @unchecked Sendable {
     func shouldForwardInput() -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        return !paused && !daemonDeviceID.isEmpty && activeTarget != daemonDeviceID
+        return captureEnabled && !paused && !daemonDeviceID.isEmpty && activeTarget != daemonDeviceID
     }
 
     func allowEdgeSwitch(detectedEdge: Bool) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard !paused && !daemonDeviceID.isEmpty && activeTarget == daemonDeviceID else {
+        guard captureEnabled && !paused && !daemonDeviceID.isEmpty && activeTarget == daemonDeviceID else {
             return false
         }
         if Date() < suppressEdgesUntil {
@@ -136,6 +139,12 @@ final class HelperState: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return edgeTargets[edge] ?? ""
+    }
+
+    func isCaptureEnabled() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return captureEnabled
     }
 }
 
@@ -663,7 +672,7 @@ final class SocketClient: @unchecked Sendable {
                 if let payload = root["payload"] {
                     let payloadData = try JSONSerialization.data(withJSONObject: payload)
                     let config = try decoder.decode(ConfigPushPayload.self, from: payloadData)
-                    Logger.log("config push daemon=\(config.daemon.name) sessions=\(config.sessions.count) active_target=\(config.active_target)")
+                    Logger.log("config push daemon=\(config.daemon.name) sessions=\(config.sessions.count) active_target=\(config.active_target) capture_enabled=\(config.capture_enabled)")
                     state.update(from: config)
                     registry.update(from: config)
                 }
@@ -770,6 +779,12 @@ final class EventTapRunner {
     private func handle(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         let keyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
         if InputInjector.shouldIgnore(type: type, event: event) {
+            return Unmanaged.passUnretained(event)
+        }
+
+        guard state.isCaptureEnabled() else {
+            moveCoalescer.clear()
+            edgeLimiter.reset()
             return Unmanaged.passUnretained(event)
         }
 
