@@ -34,6 +34,8 @@ struct InputPayload: Codable {
     let kind: String
     let dx: Double?
     let dy: Double?
+    let x: Double?
+    let y: Double?
     let key_code: Int64?
     let modifiers: Int64?
     let text: String?
@@ -193,7 +195,7 @@ final class CaptureSuppressionState: @unchecked Sendable {
         lock.lock()
         let now = Date()
         switch input.kind {
-        case "mouse_move":
+        case "mouse_move", "mouse_move_abs":
             suppressMouseUntil = max(suppressMouseUntil, now.addingTimeInterval(0.035))
         case "mouse_button":
             suppressButtonsUntil = max(suppressButtonsUntil, now.addingTimeInterval(0.05))
@@ -353,6 +355,8 @@ final class MouseMoveCoalescer: @unchecked Sendable {
             kind: "mouse_move",
             dx: pendingDX,
             dy: pendingDY,
+            x: nil,
+            y: nil,
             key_code: nil,
             modifiers: nil,
             text: nil,
@@ -417,6 +421,8 @@ final class IncomingMouseMoveCoalescer: @unchecked Sendable {
             kind: "mouse_move",
             dx: pendingDX,
             dy: pendingDY,
+            x: nil,
+            y: nil,
             key_code: nil,
             modifiers: nil,
             text: nil,
@@ -938,48 +944,48 @@ final class EventTapRunner {
             return nil
         case .leftMouseDown:
             moveCoalescer.flush()
-            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, key_code: nil, modifiers: nil, text: nil, button: "left", pressed: true))
+            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, x: nil, y: nil, key_code: nil, modifiers: nil, text: nil, button: "left", pressed: true))
             return nil
         case .leftMouseUp:
             moveCoalescer.flush()
-            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, key_code: nil, modifiers: nil, text: nil, button: "left", pressed: false))
+            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, x: nil, y: nil, key_code: nil, modifiers: nil, text: nil, button: "left", pressed: false))
             return nil
         case .rightMouseDown:
             moveCoalescer.flush()
-            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, key_code: nil, modifiers: nil, text: nil, button: "right", pressed: true))
+            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, x: nil, y: nil, key_code: nil, modifiers: nil, text: nil, button: "right", pressed: true))
             return nil
         case .rightMouseUp:
             moveCoalescer.flush()
-            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, key_code: nil, modifiers: nil, text: nil, button: "right", pressed: false))
+            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, x: nil, y: nil, key_code: nil, modifiers: nil, text: nil, button: "right", pressed: false))
             return nil
         case .otherMouseDown:
             moveCoalescer.flush()
-            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, key_code: nil, modifiers: nil, text: nil, button: buttonName(for: type, event: event), pressed: true))
+            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, x: nil, y: nil, key_code: nil, modifiers: nil, text: nil, button: buttonName(for: type, event: event), pressed: true))
             return nil
         case .otherMouseUp:
             moveCoalescer.flush()
-            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, key_code: nil, modifiers: nil, text: nil, button: buttonName(for: type, event: event), pressed: false))
+            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, x: nil, y: nil, key_code: nil, modifiers: nil, text: nil, button: buttonName(for: type, event: event), pressed: false))
             return nil
         case .scrollWheel:
             moveCoalescer.flush()
             let dy = Double(event.getIntegerValueField(.scrollWheelEventDeltaAxis1))
             let dx = Double(event.getIntegerValueField(.scrollWheelEventDeltaAxis2))
-            client.sendInput(InputPayload(kind: "scroll", dx: dx, dy: dy, key_code: nil, modifiers: nil, text: nil, button: nil, pressed: nil))
+            client.sendInput(InputPayload(kind: "scroll", dx: dx, dy: dy, x: nil, y: nil, key_code: nil, modifiers: nil, text: nil, button: nil, pressed: nil))
             return nil
         case .flagsChanged:
             moveCoalescer.flush()
             guard let isDown = modifierState.transition(for: keyCode, flags: event.flags) else {
                 return nil
             }
-            client.sendInput(InputPayload(kind: isDown ? "key_down" : "key_up", dx: nil, dy: nil, key_code: Int64(keyCode), modifiers: Int64(event.flags.rawValue), text: nil, button: nil, pressed: nil))
+            client.sendInput(InputPayload(kind: isDown ? "key_down" : "key_up", dx: nil, dy: nil, x: nil, y: nil, key_code: Int64(keyCode), modifiers: Int64(event.flags.rawValue), text: nil, button: nil, pressed: nil))
             return nil
         case .keyDown:
             moveCoalescer.flush()
-            client.sendInput(InputPayload(kind: "key_down", dx: nil, dy: nil, key_code: Int64(keyCode), modifiers: Int64(event.flags.rawValue), text: nil, button: nil, pressed: nil))
+            client.sendInput(InputPayload(kind: "key_down", dx: nil, dy: nil, x: nil, y: nil, key_code: Int64(keyCode), modifiers: Int64(event.flags.rawValue), text: nil, button: nil, pressed: nil))
             return nil
         case .keyUp:
             moveCoalescer.flush()
-            client.sendInput(InputPayload(kind: "key_up", dx: nil, dy: nil, key_code: Int64(keyCode), modifiers: Int64(event.flags.rawValue), text: nil, button: nil, pressed: nil))
+            client.sendInput(InputPayload(kind: "key_up", dx: nil, dy: nil, x: nil, y: nil, key_code: Int64(keyCode), modifiers: Int64(event.flags.rawValue), text: nil, button: nil, pressed: nil))
             return nil
         default:
             break
@@ -1068,6 +1074,8 @@ enum InputInjector {
         switch input.kind {
         case "mouse_move":
             return "mouse:\(mouseMoveType(button: input.button).rawValue):\(Int64(input.dx ?? 0)):\(Int64(input.dy ?? 0)):\(normalizedButton(input.button))"
+        case "mouse_move_abs":
+            return "mouse:\(mouseMoveType(button: input.button).rawValue):abs:\(Int64(input.x ?? 0)):\(Int64(input.y ?? 0)):\(normalizedButton(input.button))"
         case "mouse_button":
             return "button:\(mouseButtonType(button: input.button ?? "left", pressed: input.pressed ?? false).rawValue):\(normalizedButton(input.button))"
         case "scroll":
@@ -1133,6 +1141,8 @@ enum InputInjector {
         switch input.kind {
         case "mouse_move":
             try injectMouseMove(dx: input.dx ?? 0, dy: input.dy ?? 0, button: input.button)
+        case "mouse_move_abs":
+            try injectMouseMoveAbs(x: input.x ?? 0, y: input.y ?? 0, button: input.button)
         case "mouse_button":
             try injectMouseButton(button: input.button ?? "left", pressed: input.pressed ?? false)
         case "scroll":
@@ -1153,14 +1163,25 @@ enum InputInjector {
     private static func injectMouseMove(dx: Double, dy: Double, button: String?) throws {
         let location = CGEvent(source: nil)?.location ?? .zero
         let next = CGPoint(x: location.x + dx, y: location.y + dy)
+        try injectMouseMove(to: next, kind: "mouse_move", button: button)
+        Logger.input("injected mouse_move dx=\(dx) dy=\(dy) button=\(normalizedButton(button)) from=(\(location.x),\(location.y)) to=(\(next.x),\(next.y))")
+    }
+
+    private static func injectMouseMoveAbs(x: Double, y: Double, button: String?) throws {
+        let location = CGEvent(source: nil)?.location ?? .zero
+        let next = CGPoint(x: x, y: y)
+        try injectMouseMove(to: next, kind: "mouse_move_abs", button: button)
+        Logger.input("injected mouse_move_abs x=\(x) y=\(y) button=\(normalizedButton(button)) from=(\(location.x),\(location.y)) to=(\(next.x),\(next.y))")
+    }
+
+    private static func injectMouseMove(to next: CGPoint, kind: String, button: String?) throws {
         let mouseType = mouseMoveType(button: button)
         let mouseButton = cgMouseButton(for: button)
         guard let event = CGEvent(mouseEventSource: nil, mouseType: mouseType, mouseCursorPosition: next, mouseButton: mouseButton) else {
-            throw HelperError.unsupportedInput("mouse_move")
+            throw HelperError.unsupportedInput(kind)
         }
         markSynthetic(event)
         event.post(tap: .cghidEventTap)
-        Logger.input("injected mouse_move dx=\(dx) dy=\(dy) button=\(normalizedButton(button)) from=(\(location.x),\(location.y)) to=(\(next.x),\(next.y))")
     }
 
     private static func injectMouseButton(button: String, pressed: Bool) throws {
