@@ -1538,12 +1538,27 @@ func uninstallLaunchAgent(label: String) throws {
 }
 
 func openAccessibilitySettings() throws {
-    guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") else {
-        throw HelperError.invalidArguments("failed to build Accessibility settings URL")
+    // The deep-link scheme changed when macOS moved from System Preferences
+    // to System Settings. Try the current Privacy & Security route first,
+    // retain the older route for supported macOS versions, and finally open
+    // the settings app itself so the user never gets stuck on a 404 page.
+    let deepLinks = [
+        "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility",
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+    ]
+    for link in deepLinks {
+        guard let url = URL(string: link) else { continue }
+        if NSWorkspace.shared.open(url) {
+            return
+        }
     }
-    if !NSWorkspace.shared.open(url) {
-        throw HelperError.commandFailed("failed to open Accessibility settings")
+
+    let settingsApp = URL(fileURLWithPath: "/System/Applications/System Settings.app")
+    if NSWorkspace.shared.open(settingsApp) {
+        return
     }
+
+    throw HelperError.commandFailed("failed to open macOS Accessibility settings")
 }
 
 func printUsage() {
