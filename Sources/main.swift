@@ -830,9 +830,9 @@ final class EventTapRunner {
 
     func start() throws {
         if !AXIsProcessTrusted() {
-            let promptKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
-            let options = [promptKey: true] as CFDictionary
-            _ = AXIsProcessTrustedWithOptions(options)
+            // Permission prompts are user-driven from the desktop UI. Do not
+            // prompt here because the app may retry a failed helper start and
+            // otherwise macOS shows repeated authorization dialogs.
             throw HelperError.accessibilityNotGranted
         }
 
