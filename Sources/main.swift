@@ -1581,6 +1581,17 @@ func requestAccessibilityPermission() -> Bool {
     return AXIsProcessTrustedWithOptions(options)
 }
 
+func waitForAccessibilityPermission(timeout: TimeInterval = 60.0) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if AXIsProcessTrusted() {
+            return true
+        }
+        Thread.sleep(forTimeInterval: 0.5)
+    }
+    return AXIsProcessTrusted()
+}
+
 func printUsage() {
     print("""
     MouseBridge Helper
@@ -1631,9 +1642,12 @@ do {
     case .requestAccessibility:
         if requestAccessibilityPermission() {
             print("Accessibility permission: granted")
+        } else if waitForAccessibilityPermission() {
+            print("Accessibility permission: granted")
         } else {
             print("Accessibility permission: pending")
         }
+        FileHandle.standardOutput.synchronizeFile()
     case .checkAccessibility:
         if AXIsProcessTrusted() {
             print("Accessibility permission: granted")
