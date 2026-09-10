@@ -1322,6 +1322,7 @@ enum HelperCommand {
     case installLaunchAgent(dataDir: String, label: String, program: String)
     case uninstallLaunchAgent(label: String)
     case openAccessibility
+    case requestAccessibility
     case checkAccessibility
     case help
 }
@@ -1378,6 +1379,8 @@ func parseCommand() throws -> HelperCommand {
         return .uninstallLaunchAgent(label: parseLabel(from: tail, dataDir: dataDir))
     case "open-accessibility":
         return .openAccessibility
+    case "request-accessibility":
+        return .requestAccessibility
     case "check-accessibility":
         return .checkAccessibility
     case "help", "--help", "-h":
@@ -1561,6 +1564,14 @@ func openAccessibilitySettings() throws {
     throw HelperError.commandFailed("failed to open macOS Accessibility settings")
 }
 
+func requestAccessibilityPermission() -> Bool {
+    // This is intentionally only called from the explicit UI retry action.
+    // Calling AXIsProcessTrustedWithOptions during normal startup would make
+    // macOS show a repeated prompt whenever the helper restarts.
+    let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+    return AXIsProcessTrustedWithOptions(options)
+}
+
 func printUsage() {
     print("""
     MouseBridge Helper
@@ -1572,10 +1583,12 @@ func printUsage() {
       mousebridge-helper install-launch-agent [--data-dir DIR] [--label LABEL] [--program PATH]
       mousebridge-helper uninstall-launch-agent [--data-dir DIR] [--label LABEL]
       mousebridge-helper check-accessibility
+      mousebridge-helper request-accessibility
       mousebridge-helper open-accessibility
 
     Notes:
       - install-launch-agent creates a per-data-dir LaunchAgent with RunAtLoad + KeepAlive.
+      - request-accessibility asks macOS to authorize this exact helper process.
       - open-accessibility opens the macOS Accessibility settings pane.
       - set MB_HELPER_VERBOSE_INPUT=1 to enable per-input helper logs.
     """)
@@ -1606,6 +1619,12 @@ do {
         try uninstallLaunchAgent(label: label)
     case .openAccessibility:
         try openAccessibilitySettings()
+    case .requestAccessibility:
+        if requestAccessibilityPermission() {
+            print("Accessibility permission: granted")
+        } else {
+            print("Accessibility permission: pending")
+        }
     case .checkAccessibility:
         if AXIsProcessTrusted() {
             print("Accessibility permission: granted")
