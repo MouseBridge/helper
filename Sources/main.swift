@@ -1336,13 +1336,22 @@ func runHelper(dataDir: String) throws {
 
     let registry = HotkeyRegistry()
     let state = HelperState()
+
+    // The desktop app owns this process for its whole lifetime. A missing
+    // Accessibility grant is a recoverable user configuration state, not a
+    // startup failure: keep the helper alive and notice the grant without
+    // requiring the desktop app to spawn it again.
+    while !AXIsProcessTrusted() {
+        Logger.log("waiting for Accessibility permission")
+        Thread.sleep(forTimeInterval: 1.0)
+    }
+
     let client = try SocketClient(socketPath: socketPath, registry: registry, state: state)
     client.open()
-    try client.sendRegister()
-    client.startReading()
-
     let eventTap = EventTapRunner(registry: registry, state: state, client: client)
     try eventTap.start()
+    try client.sendRegister()
+    client.startReading()
 
     Logger.log("helper running")
     CFRunLoopRun()
