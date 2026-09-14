@@ -551,6 +551,8 @@ enum HotkeyParser {
             return CGKeyCode(kVK_Home)
         case "escape", "esc":
             return CGKeyCode(kVK_Escape)
+        case "backspace", "delete":
+            return CGKeyCode(kVK_Delete)
         case "end":
             return CGKeyCode(kVK_End)
         case "space":
