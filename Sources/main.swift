@@ -85,6 +85,8 @@ final class HelperState: @unchecked Sendable {
     private let lock = NSLock()
     private var daemonDeviceID = ""
     private var activeTarget = ""
+    private var hasActiveRemoteSession = false
+    private var transportConnected = false
     private var paused = false
     private var captureEnabled = true
     private var edgeTargets: [String: String] = [:]
@@ -96,6 +98,10 @@ final class HelperState: @unchecked Sendable {
         let previousTarget = activeTarget
         daemonDeviceID = payload.daemon.device_id
         activeTarget = payload.active_target
+        hasActiveRemoteSession = !activeTarget.isEmpty &&
+            activeTarget != daemonDeviceID &&
+            payload.sessions.contains { $0.device_id == activeTarget }
+        transportConnected = true
         paused = payload.paused
         captureEnabled = payload.capture_enabled
         edgeTargets = payload.edge_targets
@@ -109,13 +115,15 @@ final class HelperState: @unchecked Sendable {
     func shouldForwardInput() -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        return captureEnabled && !paused && !daemonDeviceID.isEmpty && activeTarget != daemonDeviceID
+        return captureEnabled && !paused && transportConnected &&
+            hasActiveRemoteSession && !daemonDeviceID.isEmpty && activeTarget != daemonDeviceID
     }
 
     func allowEdgeSwitch(detectedEdge: Bool) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard captureEnabled && !paused && !daemonDeviceID.isEmpty && activeTarget == daemonDeviceID else {
+        guard captureEnabled && !paused && transportConnected && !daemonDeviceID.isEmpty &&
+                activeTarget == daemonDeviceID else {
             return false
         }
         if Date() < suppressEdgesUntil {
@@ -147,6 +155,13 @@ final class HelperState: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return captureEnabled
+    }
+
+    func markTransportDisconnected() {
+        lock.lock()
+        transportConnected = false
+        hasActiveRemoteSession = false
+        lock.unlock()
     }
 }
 
@@ -642,6 +657,13 @@ final class SocketClient: @unchecked Sendable {
             throw HelperError.socketConnectFailed(socketPath)
         }
 
+        // A daemon shutdown must become a recoverable write error, never a
+        // SIGPIPE that can terminate the helper while it owns a global event tap.
+        var noSigPipe: Int32 = 1
+        _ = withUnsafePointer(to: &noSigPipe) { value in
+            setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, value, socklen_t(MemoryLayout<Int32>.size))
+        }
+
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
 
@@ -693,6 +715,7 @@ final class SocketClient: @unchecked Sendable {
                 let count = Darwin.read(fileHandle.fileDescriptor, &chunk, chunkSize)
                 if count <= 0 {
                     incomingMoveCoalescer.flush()
+                    state.markTransportDisconnected()
                     Logger.log("socket closed")
                     return
                 }
@@ -708,29 +731,20 @@ final class SocketClient: @unchecked Sendable {
     }
 
     func sendHotkey(action: String, combo: String) {
-        do {
-            try send(type: "hotkey", payload: HotkeyPayload(action: action, combo: combo))
+        sendAsync(type: "hotkey", payload: HotkeyPayload(action: action, combo: combo)) {
             Logger.log("sent hotkey action=\(action) combo=\(combo)")
-        } catch {
-            Logger.log("send hotkey failed: \(error)")
         }
     }
 
     func sendEdge(edge: String, pct: Double) {
-        do {
-            try send(type: "edge", payload: EdgePayload(edge: edge, pct: pct))
+        sendAsync(type: "edge", payload: EdgePayload(edge: edge, pct: pct)) {
             Logger.log("sent edge edge=\(edge) pct=\(pct)")
-        } catch {
-            Logger.log("send edge failed: \(error)")
         }
     }
 
     func sendInput(_ payload: InputPayload) {
-        do {
-            try send(type: "input", payload: payload)
+        sendAsync(type: "input", payload: payload) {
             Logger.input("sent input kind=\(payload.kind)")
-        } catch {
-            Logger.log("send input failed: \(error)")
         }
     }
 
@@ -790,20 +804,46 @@ final class SocketClient: @unchecked Sendable {
         let env = Envelope(type: type, payload: payload)
         let data = try encoder.encode(env) + Data([0x0A])
         try writeQueue.sync {
-            try data.withUnsafeBytes { rawBuffer in
-                guard let base = rawBuffer.bindMemory(to: UInt8.self).baseAddress else {
+            try writeLocked(data)
+        }
+    }
+
+    // Never perform socket I/O on the CGEventTap callback thread. A blocked or
+    // broken daemon connection must not freeze keyboard/mouse delivery for the
+    // entire system.
+    private func sendAsync<T: Encodable>(type: String, payload: T, onSuccess: (@Sendable () -> Void)? = nil) {
+        do {
+            let env = Envelope(type: type, payload: payload)
+            let data = try encoder.encode(env) + Data([0x0A])
+            writeQueue.async { [weak self] in
+                guard let self else { return }
+                do {
+                    try self.writeLocked(data)
+                    onSuccess?()
+                } catch {
+                    self.state.markTransportDisconnected()
+                    Logger.log("send \(type) failed: \(error)")
+                }
+            }
+        } catch {
+            Logger.log("encode \(type) failed: \(error)")
+        }
+    }
+
+    private func writeLocked(_ data: Data) throws {
+        try data.withUnsafeBytes { rawBuffer in
+            guard let base = rawBuffer.bindMemory(to: UInt8.self).baseAddress else {
+                throw HelperError.writeFailed
+            }
+            var remaining = data.count
+            var pointer = base
+            while remaining > 0 {
+                let written = Darwin.write(fileHandle.fileDescriptor, pointer, remaining)
+                if written <= 0 {
                     throw HelperError.writeFailed
                 }
-                var remaining = data.count
-                var pointer = base
-                while remaining > 0 {
-                    let written = Darwin.write(fileHandle.fileDescriptor, pointer, remaining)
-                    if written <= 0 {
-                        throw HelperError.writeFailed
-                    }
-                    remaining -= written
-                    pointer = pointer.advanced(by: written)
-                }
+                remaining -= written
+                pointer = pointer.advanced(by: written)
             }
         }
     }
