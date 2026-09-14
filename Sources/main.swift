@@ -515,6 +515,10 @@ enum HotkeyParser {
             return nil
         }
 
+        guard parts.dropLast().allSatisfy(isModifier) else {
+            return nil
+        }
+
         let modifiers = parts.dropLast().reduce(CGEventFlags()) { partial, token in
             partial.union(modifierFlag(for: token))
         }
@@ -535,6 +539,10 @@ enum HotkeyParser {
         default:
             return []
         }
+    }
+
+    private static func isModifier(_ token: String) -> Bool {
+        ["cmd", "command", "shift", "alt", "option", "ctrl", "control"].contains(token)
     }
 
     private static func keyCode(for token: String) -> CGKeyCode? {
@@ -621,10 +629,16 @@ final class HotkeyRegistry {
     private var hotkeys: [ParsedHotkey] = []
 
     func update(from payload: ConfigPushPayload) {
+        var seen = Set<String>()
         hotkeys = payload.hotkeys.compactMap { action, combo in
             guard !combo.isEmpty else { return nil }
             guard let parsed = HotkeyParser.parse(action: action, combo: combo) else {
                 Logger.log("unsupported hotkey combo action=\(action) combo=\(combo)")
+                return nil
+            }
+            let signature = "\(parsed.keyCode):\(parsed.modifiers.rawValue)"
+            guard seen.insert(signature).inserted else {
+                Logger.log("duplicate hotkey combo action=\(action) combo=\(combo)")
                 return nil
             }
             return parsed
@@ -1050,6 +1064,10 @@ final class EventTapRunner {
 
     private func mouseButtonName(number: Int64) -> String {
         switch number {
+        case 0:
+            return "left"
+        case 1:
+            return "right"
         case 2:
             return "middle"
         default:
@@ -1149,7 +1167,7 @@ enum InputInjector {
             case .rightMouseDragged:
                 button = "right"
             case .otherMouseDragged:
-                button = event.getIntegerValueField(.mouseEventButtonNumber) == 2 ? "middle" : "other"
+                button = buttonNameForNumber(event.getIntegerValueField(.mouseEventButtonNumber))
             default:
                 button = ""
             }
@@ -1162,7 +1180,7 @@ enum InputInjector {
             case .rightMouseDown, .rightMouseUp:
                 button = "right"
             case .otherMouseDown, .otherMouseUp:
-                button = event.getIntegerValueField(.mouseEventButtonNumber) == 2 ? "middle" : "other"
+                button = buttonNameForNumber(event.getIntegerValueField(.mouseEventButtonNumber))
             default:
                 button = ""
             }
@@ -1175,6 +1193,15 @@ enum InputInjector {
             signature = "type:\(type.rawValue)"
         }
         return guardState.shouldIgnore(signature: signature)
+    }
+
+    private static func buttonNameForNumber(_ number: Int64) -> String {
+        switch number {
+        case 0: return "left"
+        case 1: return "right"
+        case 2: return "middle"
+        default: return "other"
+        }
     }
 
     static func inject(_ input: InputPayload) throws {
