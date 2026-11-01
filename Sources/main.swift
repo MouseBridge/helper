@@ -732,8 +732,8 @@ final class SocketClient: @unchecked Sendable {
                 if count <= 0 {
                     incomingMoveCoalescer.flush()
                     state.markTransportDisconnected()
-                    Logger.log("socket closed")
-                    return
+                    Logger.log("socket closed, exiting helper so supervisor can restart it")
+                    exit(1)
                 }
                 buffer.append(chunk, count: count)
 
@@ -865,7 +865,7 @@ final class SocketClient: @unchecked Sendable {
     }
 }
 
-final class EventTapRunner {
+final class EventTapRunner: @unchecked Sendable {
     private let registry: HotkeyRegistry
     private let state: HelperState
     private let client: SocketClient
@@ -926,7 +926,21 @@ final class EventTapRunner {
         Logger.log("event tap started")
     }
 
+    func reenableIfNeeded() {
+        guard let tap = self.tap else { return }
+        CGEvent.tapEnable(tap: tap, enable: true)
+        Logger.log("event tap re-enabled")
+    }
+
     private func handle(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            if let tap = self.tap {
+                CGEvent.tapEnable(tap: tap, enable: true)
+                Logger.log("re-enabled event tap after \(type == .tapDisabledByTimeout ? "timeout" : "user input")")
+            }
+            return Unmanaged.passUnretained(event)
+        }
+
         let keyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
         if InputInjector.shouldIgnore(type: type, event: event) {
             return Unmanaged.passUnretained(event)
@@ -1415,12 +1429,43 @@ func runHelper(dataDir: String) throws {
         Thread.sleep(forTimeInterval: 1.0)
     }
 
-    let client = try SocketClient(socketPath: socketPath, registry: registry, state: state)
+    var client: SocketClient?
+    for attempt in 1...20 {
+        do {
+            client = try SocketClient(socketPath: socketPath, registry: registry, state: state)
+            break
+        } catch {
+            if attempt == 20 { throw error }
+            Logger.log("waiting for daemon socket at \(socketPath) (attempt \(attempt)/20)")
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+    }
+    guard let client = client else {
+        throw HelperError.socketConnectFailed(socketPath)
+    }
+
     client.open()
     let eventTap = EventTapRunner(registry: registry, state: state, client: client)
     try eventTap.start()
     try client.sendRegister()
     client.startReading()
+
+    NSWorkspace.shared.notificationCenter.addObserver(
+        forName: NSWorkspace.didWakeNotification,
+        object: nil,
+        queue: .main
+    ) { _ in
+        Logger.log("system woke from sleep, re-enabling event tap")
+        eventTap.reenableIfNeeded()
+    }
+    NSWorkspace.shared.notificationCenter.addObserver(
+        forName: NSWorkspace.screensDidWakeNotification,
+        object: nil,
+        queue: .main
+    ) { _ in
+        Logger.log("screens woke from sleep, re-enabling event tap")
+        eventTap.reenableIfNeeded()
+    }
 
     Logger.log("helper running")
     CFRunLoopRun()
