@@ -83,6 +83,36 @@ let emergencyReturnCombo = "ctrl+alt+escape"
 let emergencyReturnKeyCode = CGKeyCode(kVK_Escape)
 let emergencyReturnModifiers: CGEventFlags = [.maskControl, .maskAlternate]
 
+final class LocalCursorFreezeController: @unchecked Sendable {
+    static let shared = LocalCursorFreezeController()
+    private let lock = NSLock()
+    private var frozen = false
+
+    func sync(shouldFreeze: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        if shouldFreeze && !frozen {
+            CGAssociateMouseAndMouseCursorPosition(boolean_t(0))
+            frozen = true
+            Logger.log("local cursor movement frozen while controlling remote device")
+        } else if !shouldFreeze && frozen {
+            CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
+            frozen = false
+            Logger.log("local cursor movement restored to host")
+        }
+    }
+
+    func forceRestore() {
+        lock.lock()
+        defer { lock.unlock() }
+        CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
+        if frozen {
+            frozen = false
+            Logger.log("local cursor movement force-restored to host")
+        }
+    }
+}
+
 final class HelperState: @unchecked Sendable {
     private let lock = NSLock()
     private var daemonDeviceID = ""
@@ -119,7 +149,10 @@ final class HelperState: @unchecked Sendable {
             requireEdgeNeutral = true
             suppressEdgesUntil = max(suppressEdgesUntil, Date().addingTimeInterval(1.5))
         }
+        let shouldFreeze = captureEnabled && !paused && transportConnected &&
+            hasActiveRemoteSession && !daemonDeviceID.isEmpty && activeTarget != daemonDeviceID
         lock.unlock()
+        LocalCursorFreezeController.shared.sync(shouldFreeze: shouldFreeze)
     }
 
     func mouseSpeed() -> Double {
@@ -184,6 +217,7 @@ final class HelperState: @unchecked Sendable {
         transportConnected = false
         hasActiveRemoteSession = false
         lock.unlock()
+        LocalCursorFreezeController.shared.forceRestore()
     }
 }
 
@@ -1047,6 +1081,7 @@ final class EventTapRunner: @unchecked Sendable {
         }
 
         guard state.isCaptureEnabled() else {
+            LocalCursorFreezeController.shared.sync(shouldFreeze: false)
             moveCoalescer.clear()
             edgeLimiter.reset()
             forwardedRegularKeyCodes.removeAll()
@@ -1064,6 +1099,9 @@ final class EventTapRunner: @unchecked Sendable {
                 if let match = registry.match(keyCode: keyCode, flags: flags) {
                     swallowedHotkeyKeyCodes.insert(keyCode)
                     releaseForwardedInputs(currentFlags: flags)
+                    if match.action == "switch_to_host" || match.action == "disconnect_all" || match.action == "toggle_pause" {
+                        LocalCursorFreezeController.shared.sync(shouldFreeze: false)
+                    }
                     if match.action == "switch_to_host" {
                         state.suppressEdgeSwitching(for: 2.0)
                     }
@@ -1073,6 +1111,7 @@ final class EventTapRunner: @unchecked Sendable {
                 if matchesEmergencyReturn(keyCode: keyCode, flags: flags) {
                     swallowedHotkeyKeyCodes.insert(keyCode)
                     releaseForwardedInputs(currentFlags: flags)
+                    LocalCursorFreezeController.shared.sync(shouldFreeze: false)
                     state.suppressEdgeSwitching(for: 2.0)
                     client.sendHotkey(action: "switch_to_host", combo: emergencyReturnCombo)
                     return nil
@@ -1100,6 +1139,7 @@ final class EventTapRunner: @unchecked Sendable {
         }
 
         guard state.shouldForwardInput() else {
+            LocalCursorFreezeController.shared.sync(shouldFreeze: false)
             moveCoalescer.clear()
             forwardedRegularKeyCodes.removeAll()
             modifierState.clearForwarded()
@@ -1108,6 +1148,8 @@ final class EventTapRunner: @unchecked Sendable {
             }
             return Unmanaged.passUnretained(event)
         }
+
+        LocalCursorFreezeController.shared.sync(shouldFreeze: true)
 
         switch type {
         case .mouseMoved:
@@ -1731,6 +1773,17 @@ func runHelper(dataDir: String) throws {
     }
 
     Logger.log("helper running")
+    atexit {
+        LocalCursorFreezeController.shared.forceRestore()
+    }
+    signal(SIGTERM) { _ in
+        LocalCursorFreezeController.shared.forceRestore()
+        exit(0)
+    }
+    signal(SIGINT) { _ in
+        LocalCursorFreezeController.shared.forceRestore()
+        exit(0)
+    }
     CFRunLoopRun()
 }
 
