@@ -68,6 +68,8 @@ struct ConfigPushPayload: Decodable {
     let active_target: String
     let paused: Bool
     let capture_enabled: Bool
+    let mouse_speed: Double?
+    let scroll_speed: Double?
 }
 
 struct ParsedHotkey {
@@ -89,6 +91,8 @@ final class HelperState: @unchecked Sendable {
     private var transportConnected = false
     private var paused = false
     private var captureEnabled = true
+    private var mouseSpeedValue: Double = 1.5
+    private var scrollSpeedValue: Double = 2.0
     private var edgeTargets: [String: String] = [:]
     private var requireEdgeNeutral = false
     private var suppressEdgesUntil = Date.distantPast
@@ -104,12 +108,30 @@ final class HelperState: @unchecked Sendable {
         transportConnected = true
         paused = payload.paused
         captureEnabled = payload.capture_enabled
+        if let mouseSpeed = payload.mouse_speed, mouseSpeed > 0 {
+            mouseSpeedValue = min(max(mouseSpeed, 0.2), 6.0)
+        }
+        if let scrollSpeed = payload.scroll_speed, scrollSpeed > 0 {
+            scrollSpeedValue = min(max(scrollSpeed, 0.2), 10.0)
+        }
         edgeTargets = payload.edge_targets
         if !daemonDeviceID.isEmpty && previousTarget != daemonDeviceID && activeTarget == daemonDeviceID {
             requireEdgeNeutral = true
             suppressEdgesUntil = max(suppressEdgesUntil, Date().addingTimeInterval(1.5))
         }
         lock.unlock()
+    }
+
+    func mouseSpeed() -> Double {
+        lock.lock()
+        defer { lock.unlock() }
+        return mouseSpeedValue
+    }
+
+    func scrollSpeed() -> Double {
+        lock.lock()
+        defer { lock.unlock() }
+        return scrollSpeedValue
     }
 
     func shouldForwardInput() -> Bool {
@@ -246,30 +268,90 @@ final class CaptureSuppressionState: @unchecked Sendable {
     }
 }
 
+let trackedModifierFlags: CGEventFlags = [.maskCommand, .maskShift, .maskAlternate, .maskControl]
+
 final class ModifierState {
     private let lock = NSLock()
     private var lastFlags = CGEventFlags()
+    private var suppressedFlags = CGEventFlags()
+    private var forwardedKeyCodes = Set<CGKeyCode>()
 
-    func transition(for keyCode: CGKeyCode, flags: CGEventFlags) -> Bool? {
-        guard let modifierFlag = modifierFlag(for: keyCode) else {
+    func syncLocal(flags: CGEventFlags) {
+        let normalized = flags.intersection(trackedModifierFlags)
+        lock.lock()
+        suppressedFlags.formIntersection(normalized)
+        lastFlags = normalized
+        lock.unlock()
+    }
+
+    func effectiveFlags(for flags: CGEventFlags) -> CGEventFlags {
+        let normalized = flags.intersection(trackedModifierFlags)
+        lock.lock()
+        suppressedFlags.formIntersection(normalized)
+        let clean = flags.subtracting(suppressedFlags)
+        lock.unlock()
+        return clean
+    }
+
+    func consumeForwardedAndSuppress(flags: CGEventFlags) -> [CGKeyCode] {
+        let normalized = flags.intersection(trackedModifierFlags)
+        lock.lock()
+        suppressedFlags = normalized
+        lastFlags = normalized
+        let codes = forwardedKeyCodes.sorted()
+        forwardedKeyCodes.removeAll()
+        lock.unlock()
+        return codes
+    }
+
+    func clearForwarded() {
+        lock.lock()
+        forwardedKeyCodes.removeAll()
+        lock.unlock()
+    }
+
+    func transition(for keyCode: CGKeyCode, flags: CGEventFlags) -> (isDown: Bool, cleanFlags: CGEventFlags)? {
+        guard let modifierFlag = Self.modifierFlag(for: keyCode) else {
             return nil
         }
 
+        let normalized = flags.intersection(trackedModifierFlags)
         lock.lock()
         defer {
-            lastFlags = flags
+            lastFlags = normalized
             lock.unlock()
         }
 
         let wasPressed = lastFlags.contains(modifierFlag)
-        let isPressed = flags.contains(modifierFlag)
-        if wasPressed == isPressed {
+        let isPressed = normalized.contains(modifierFlag)
+
+        if !isPressed && suppressedFlags.contains(modifierFlag) {
+            suppressedFlags.remove(modifierFlag)
+            forwardedKeyCodes.remove(keyCode)
             return nil
         }
-        return isPressed
+        suppressedFlags.formIntersection(normalized)
+
+        if wasPressed == isPressed {
+            if !isPressed && forwardedKeyCodes.remove(keyCode) != nil {
+                return (false, flags.subtracting(suppressedFlags).subtracting(modifierFlag))
+            }
+            return nil
+        }
+
+        if isPressed {
+            suppressedFlags.remove(modifierFlag)
+            forwardedKeyCodes.insert(keyCode)
+            return (true, flags.subtracting(suppressedFlags))
+        } else {
+            guard forwardedKeyCodes.remove(keyCode) != nil else {
+                return nil
+            }
+            return (false, flags.subtracting(suppressedFlags).subtracting(modifierFlag))
+        }
     }
 
-    private func modifierFlag(for keyCode: CGKeyCode) -> CGEventFlags? {
+    static func modifierFlag(for keyCode: CGKeyCode) -> CGEventFlags? {
         switch Int(keyCode) {
         case kVK_Command, kVK_RightCommand:
             return .maskCommand
@@ -786,6 +868,9 @@ final class SocketClient: @unchecked Sendable {
                     Logger.log("config push daemon=\(config.daemon.name) sessions=\(config.sessions.count) active_target=\(config.active_target) capture_enabled=\(config.capture_enabled)")
                     state.update(from: config)
                     registry.update(from: config)
+                    if config.paused || !config.capture_enabled || config.sessions.isEmpty {
+                        InputInjector.resetModifiers()
+                    }
                 }
             case "input":
                 if let payload = root["payload"] {
@@ -874,6 +959,7 @@ final class EventTapRunner: @unchecked Sendable {
     private let moveCoalescer: MouseMoveCoalescer
     private var tap: CFMachPort?
     private var swallowedHotkeyKeyCodes = Set<CGKeyCode>()
+    private var forwardedRegularKeyCodes = Set<CGKeyCode>()
 
     init(registry: HotkeyRegistry, state: HelperState, client: SocketClient) {
         self.registry = registry
@@ -932,6 +1018,20 @@ final class EventTapRunner: @unchecked Sendable {
         Logger.log("event tap re-enabled")
     }
 
+    private func releaseForwardedInputs(currentFlags: CGEventFlags) {
+        moveCoalescer.flush()
+        let regularCodes = forwardedRegularKeyCodes.sorted()
+        forwardedRegularKeyCodes.removeAll()
+        let modifierCodes = modifierState.consumeForwardedAndSuppress(flags: currentFlags)
+        guard state.shouldForwardInput() else { return }
+        for code in regularCodes {
+            client.sendInput(InputPayload(kind: "key_up", dx: nil, dy: nil, x: nil, y: nil, key_code: Int64(code), modifiers: 0, text: nil, button: nil, pressed: nil))
+        }
+        for code in modifierCodes {
+            client.sendInput(InputPayload(kind: "key_up", dx: nil, dy: nil, x: nil, y: nil, key_code: Int64(code), modifiers: 0, text: nil, button: nil, pressed: nil))
+        }
+    }
+
     private func handle(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             if let tap = self.tap {
@@ -949,15 +1049,21 @@ final class EventTapRunner: @unchecked Sendable {
         guard state.isCaptureEnabled() else {
             moveCoalescer.clear()
             edgeLimiter.reset()
+            forwardedRegularKeyCodes.removeAll()
+            modifierState.clearForwarded()
             return Unmanaged.passUnretained(event)
         }
 
         if type == .keyDown {
+            if swallowedHotkeyKeyCodes.contains(keyCode) {
+                return nil
+            }
             let flags = event.flags
             let isRepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
             if !isRepeat {
                 if let match = registry.match(keyCode: keyCode, flags: flags) {
                     swallowedHotkeyKeyCodes.insert(keyCode)
+                    releaseForwardedInputs(currentFlags: flags)
                     if match.action == "switch_to_host" {
                         state.suppressEdgeSwitching(for: 2.0)
                     }
@@ -966,6 +1072,7 @@ final class EventTapRunner: @unchecked Sendable {
                 }
                 if matchesEmergencyReturn(keyCode: keyCode, flags: flags) {
                     swallowedHotkeyKeyCodes.insert(keyCode)
+                    releaseForwardedInputs(currentFlags: flags)
                     state.suppressEdgeSwitching(for: 2.0)
                     client.sendHotkey(action: "switch_to_host", combo: emergencyReturnCombo)
                     return nil
@@ -994,20 +1101,27 @@ final class EventTapRunner: @unchecked Sendable {
 
         guard state.shouldForwardInput() else {
             moveCoalescer.clear()
+            forwardedRegularKeyCodes.removeAll()
+            modifierState.clearForwarded()
+            if type == .flagsChanged {
+                modifierState.syncLocal(flags: event.flags)
+            }
             return Unmanaged.passUnretained(event)
         }
 
         switch type {
         case .mouseMoved:
-            let dx = Double(event.getIntegerValueField(.mouseEventDeltaX))
-            let dy = Double(event.getIntegerValueField(.mouseEventDeltaY))
+            let speed = state.mouseSpeed()
+            let dx = Double(event.getIntegerValueField(.mouseEventDeltaX)) * speed
+            let dy = Double(event.getIntegerValueField(.mouseEventDeltaY)) * speed
             if dx != 0 || dy != 0 {
                 moveCoalescer.enqueue(dx: dx, dy: dy, button: nil)
             }
             return nil
         case .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
-            let dx = Double(event.getIntegerValueField(.mouseEventDeltaX))
-            let dy = Double(event.getIntegerValueField(.mouseEventDeltaY))
+            let speed = state.mouseSpeed()
+            let dx = Double(event.getIntegerValueField(.mouseEventDeltaX)) * speed
+            let dy = Double(event.getIntegerValueField(.mouseEventDeltaY)) * speed
             if dx != 0 || dy != 0 {
                 moveCoalescer.enqueue(dx: dx, dy: dy, button: buttonName(for: type, event: event))
             }
@@ -1038,24 +1152,32 @@ final class EventTapRunner: @unchecked Sendable {
             return nil
         case .scrollWheel:
             moveCoalescer.flush()
-            let dy = Double(event.getIntegerValueField(.scrollWheelEventDeltaAxis1))
-            let dx = Double(event.getIntegerValueField(.scrollWheelEventDeltaAxis2))
-            client.sendInput(InputPayload(kind: "scroll", dx: dx, dy: dy, x: nil, y: nil, key_code: nil, modifiers: nil, text: nil, button: nil, pressed: nil))
+            let rawScroll = Self.extractScrollDeltas(from: event)
+            let scrollSpeed = state.scrollSpeed()
+            let dx = rawScroll.dx * scrollSpeed
+            let dy = rawScroll.dy * scrollSpeed
+            if dx != 0 || dy != 0 {
+                client.sendInput(InputPayload(kind: "scroll", dx: dx, dy: dy, x: nil, y: nil, key_code: nil, modifiers: nil, text: nil, button: nil, pressed: nil))
+            }
             return nil
         case .flagsChanged:
             moveCoalescer.flush()
-            guard let isDown = modifierState.transition(for: keyCode, flags: event.flags) else {
+            guard let transition = modifierState.transition(for: keyCode, flags: event.flags) else {
                 return nil
             }
-            client.sendInput(InputPayload(kind: isDown ? "key_down" : "key_up", dx: nil, dy: nil, x: nil, y: nil, key_code: Int64(keyCode), modifiers: Int64(event.flags.rawValue), text: nil, button: nil, pressed: nil))
+            client.sendInput(InputPayload(kind: transition.isDown ? "key_down" : "key_up", dx: nil, dy: nil, x: nil, y: nil, key_code: Int64(keyCode), modifiers: Int64(transition.cleanFlags.rawValue), text: nil, button: nil, pressed: nil))
             return nil
         case .keyDown:
             moveCoalescer.flush()
-            client.sendInput(InputPayload(kind: "key_down", dx: nil, dy: nil, x: nil, y: nil, key_code: Int64(keyCode), modifiers: Int64(event.flags.rawValue), text: nil, button: nil, pressed: nil))
+            forwardedRegularKeyCodes.insert(keyCode)
+            let cleanFlags = modifierState.effectiveFlags(for: event.flags)
+            client.sendInput(InputPayload(kind: "key_down", dx: nil, dy: nil, x: nil, y: nil, key_code: Int64(keyCode), modifiers: Int64(cleanFlags.rawValue), text: nil, button: nil, pressed: nil))
             return nil
         case .keyUp:
             moveCoalescer.flush()
-            client.sendInput(InputPayload(kind: "key_up", dx: nil, dy: nil, x: nil, y: nil, key_code: Int64(keyCode), modifiers: Int64(event.flags.rawValue), text: nil, button: nil, pressed: nil))
+            forwardedRegularKeyCodes.remove(keyCode)
+            let cleanFlags = modifierState.effectiveFlags(for: event.flags)
+            client.sendInput(InputPayload(kind: "key_up", dx: nil, dy: nil, x: nil, y: nil, key_code: Int64(keyCode), modifiers: Int64(cleanFlags.rawValue), text: nil, button: nil, pressed: nil))
             return nil
         default:
             break
@@ -1096,6 +1218,41 @@ final class EventTapRunner: @unchecked Sendable {
         default:
             return false
         }
+    }
+
+    private static func extractScrollDeltas(from event: CGEvent) -> (dx: Double, dy: Double) {
+        let isContinuous = event.getIntegerValueField(.scrollWheelEventIsContinuous) != 0
+        let pointDY = Double(event.getIntegerValueField(.scrollWheelEventPointDeltaAxis1))
+        let pointDX = Double(event.getIntegerValueField(.scrollWheelEventPointDeltaAxis2))
+        let fixedDY = event.getDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1)
+        let fixedDX = event.getDoubleValueField(.scrollWheelEventFixedPtDeltaAxis2)
+        let lineDY = Double(event.getIntegerValueField(.scrollWheelEventDeltaAxis1))
+        let lineDX = Double(event.getIntegerValueField(.scrollWheelEventDeltaAxis2))
+
+        let resolveAxis = { (point: Double, fixed: Double, line: Double) -> Double in
+            if isContinuous {
+                if point != 0 {
+                    return point
+                }
+                if fixed != 0 {
+                    return fixed * 10.0
+                }
+                return line * 24.0
+            }
+            let linePixels = line * 28.0
+            if abs(point) > abs(linePixels) {
+                return point
+            }
+            if linePixels != 0 {
+                return linePixels
+            }
+            if fixed != 0 {
+                return fixed * 28.0
+            }
+            return point
+        }
+
+        return (dx: resolveAxis(pointDX, fixedDX, lineDX), dy: resolveAxis(pointDY, fixedDY, lineDY))
     }
 
     private func matchesEmergencyReturn(keyCode: CGKeyCode, flags: CGEventFlags) -> Bool {
@@ -1139,10 +1296,87 @@ enum HelperError: Error, CustomStringConvertible {
     }
 }
 
+final class RemoteModifierTracker: @unchecked Sendable {
+    private let lock = NSLock()
+    private var activeFlags = CGEventFlags()
+    private var heldKeyCodes = Set<CGKeyCode>()
+
+    func currentFlags() -> CGEventFlags {
+        lock.lock()
+        defer { lock.unlock() }
+        return activeFlags
+    }
+
+    func updateForKeyEvent(keyCode: CGKeyCode, isDown: Bool, rawFlags: CGEventFlags) -> CGEventFlags {
+        var sanitized = rawFlags.intersection(trackedModifierFlags)
+        lock.lock()
+        defer { lock.unlock() }
+
+        if let modFlag = ModifierState.modifierFlag(for: keyCode) {
+            if isDown {
+                sanitized.insert(modFlag)
+                heldKeyCodes.insert(keyCode)
+            } else {
+                sanitized.remove(modFlag)
+                heldKeyCodes.remove(keyCode)
+            }
+        }
+        activeFlags = sanitized
+        return sanitized
+    }
+
+    func consumeReset() -> [CGKeyCode] {
+        lock.lock()
+        activeFlags = []
+        let codes = heldKeyCodes.sorted()
+        heldKeyCodes.removeAll()
+        lock.unlock()
+        return codes
+    }
+}
+
 enum InputInjector {
     private static let guardState = InjectionGuard()
     private static let captureSuppression = CaptureSuppressionState()
+    private static let remoteModifiers = RemoteModifierTracker()
     private static let syntheticMarker: Int64 = 0x4D420001
+
+    static func resetModifiers() {
+        let codes = remoteModifiers.consumeReset()
+        for code in codes {
+            if let event = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false) {
+                event.flags = []
+                markSynthetic(event)
+                event.post(tap: .cghidEventTap)
+            }
+        }
+    }
+
+    private static func clearStuckSystemModifiers(stuckFlags: CGEventFlags, activeFlags: CGEventFlags) {
+        var releaseCodes: [CGKeyCode] = []
+        if stuckFlags.contains(.maskControl) {
+            releaseCodes.append(contentsOf: [CGKeyCode(kVK_Control), CGKeyCode(kVK_RightControl)])
+        }
+        if stuckFlags.contains(.maskAlternate) {
+            releaseCodes.append(contentsOf: [CGKeyCode(kVK_Option), CGKeyCode(kVK_RightOption)])
+        }
+        if stuckFlags.contains(.maskShift) {
+            releaseCodes.append(contentsOf: [CGKeyCode(kVK_Shift), CGKeyCode(kVK_RightShift)])
+        }
+        if stuckFlags.contains(.maskCommand) {
+            releaseCodes.append(contentsOf: [CGKeyCode(kVK_Command), CGKeyCode(kVK_RightCommand)])
+        }
+        for code in releaseCodes {
+            let sig = "key:any:\(Int64(code))"
+            guardState.record(sig)
+            if let keyUp = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false) {
+                keyUp.flags = activeFlags
+                markSynthetic(keyUp)
+                keyUp.post(tap: .cghidEventTap)
+            }
+        }
+        Logger.input("cleared stuck system modifiers=\(stuckFlags.rawValue) active=\(activeFlags.rawValue)")
+    }
 
     static func signature(for input: InputPayload) -> String {
         switch input.kind {
@@ -1246,47 +1480,72 @@ enum InputInjector {
     private static func injectMouseMove(dx: Double, dy: Double, button: String?) throws {
         let location = CGEvent(source: nil)?.location ?? .zero
         let next = CGPoint(x: location.x + dx, y: location.y + dy)
-        try injectMouseMove(to: next, kind: "mouse_move", button: button)
+        try injectMouseMove(to: next, dx: dx, dy: dy, kind: "mouse_move", button: button)
         Logger.input("injected mouse_move dx=\(dx) dy=\(dy) button=\(normalizedButton(button)) from=(\(location.x),\(location.y)) to=(\(next.x),\(next.y))")
     }
 
     private static func injectMouseMoveAbs(x: Double, y: Double, button: String?) throws {
         let location = CGEvent(source: nil)?.location ?? .zero
         let next = CGPoint(x: x, y: y)
-        try injectMouseMove(to: next, kind: "mouse_move_abs", button: button)
+        try injectMouseMove(to: next, dx: next.x - location.x, dy: next.y - location.y, kind: "mouse_move_abs", button: button)
         Logger.input("injected mouse_move_abs x=\(x) y=\(y) button=\(normalizedButton(button)) from=(\(location.x),\(location.y)) to=(\(next.x),\(next.y))")
     }
 
-    private static func injectMouseMove(to next: CGPoint, kind: String, button: String?) throws {
+    private static func injectMouseMove(to next: CGPoint, dx: Double, dy: Double, kind: String, button: String?) throws {
         let mouseType = mouseMoveType(button: button)
         let mouseButton = cgMouseButton(for: button)
         guard let event = CGEvent(mouseEventSource: nil, mouseType: mouseType, mouseCursorPosition: next, mouseButton: mouseButton) else {
             throw HelperError.unsupportedInput(kind)
         }
+        event.setIntegerValueField(.mouseEventDeltaX, value: Int64(dx.rounded()))
+        event.setIntegerValueField(.mouseEventDeltaY, value: Int64(dy.rounded()))
+        event.flags = remoteModifiers.currentFlags()
         markSynthetic(event)
         event.post(tap: .cghidEventTap)
     }
 
     private static func injectMouseButton(button: String, pressed: Bool) throws {
-        let location = CGEvent(source: nil)?.location ?? .zero
+        let probe = CGEvent(source: nil)
+        let location = probe?.location ?? .zero
+        let activeFlags = remoteModifiers.currentFlags()
+        if let systemFlags = probe?.flags.intersection(trackedModifierFlags) {
+            let stuckFlags = systemFlags.subtracting(activeFlags)
+            if !stuckFlags.isEmpty {
+                clearStuckSystemModifiers(stuckFlags: stuckFlags, activeFlags: activeFlags)
+            }
+        }
         let mouseButton = cgMouseButton(for: button)
         let mouseType = mouseButtonType(button: button, pressed: pressed)
 
         guard let event = CGEvent(mouseEventSource: nil, mouseType: mouseType, mouseCursorPosition: location, mouseButton: mouseButton) else {
             throw HelperError.unsupportedInput("mouse_button")
         }
+        event.flags = activeFlags
         markSynthetic(event)
         event.post(tap: .cghidEventTap)
-        Logger.input("injected mouse_button button=\(button) pressed=\(pressed)")
+        Logger.input("injected mouse_button button=\(button) pressed=\(pressed) flags=\(activeFlags.rawValue)")
+    }
+
+    private static func scrollPixelDelta(_ value: Double) -> Int32 {
+        guard value != 0 else { return 0 }
+        let clamped = max(Double(Int32.min), min(Double(Int32.max), value.rounded()))
+        let rounded = Int32(clamped)
+        if rounded != 0 {
+            return rounded
+        }
+        return value > 0 ? 1 : -1
     }
 
     private static func injectScroll(dx: Double, dy: Double) throws {
-        guard let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: Int32(dy), wheel2: Int32(dx), wheel3: 0) else {
+        let wheelY = scrollPixelDelta(dy)
+        let wheelX = scrollPixelDelta(dx)
+        guard let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: wheelY, wheel2: wheelX, wheel3: 0) else {
             throw HelperError.unsupportedInput("scroll")
         }
+        event.flags = remoteModifiers.currentFlags()
         markSynthetic(event)
         event.post(tap: .cghidEventTap)
-        Logger.input("injected scroll dx=\(dx) dy=\(dy)")
+        Logger.input("injected scroll dx=\(dx) dy=\(dy) wheelX=\(wheelX) wheelY=\(wheelY)")
     }
 
     private static func injectKeyTap(keyCode: Int64, modifiers: Int64) throws {
@@ -1305,6 +1564,8 @@ enum InputInjector {
             var mutableUnits = units
             keyDown.keyboardSetUnicodeString(stringLength: mutableUnits.count, unicodeString: &mutableUnits)
             keyUp.keyboardSetUnicodeString(stringLength: mutableUnits.count, unicodeString: &mutableUnits)
+            keyDown.flags = []
+            keyUp.flags = []
             markSynthetic(keyDown)
             markSynthetic(keyUp)
             keyDown.post(tap: .cghidEventTap)
@@ -1324,16 +1585,18 @@ enum InputInjector {
             throw HelperError.unsupportedInput(kind)
         }
 
-        guard let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(keyCode), keyDown: true),
-              let keyUp = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(keyCode), keyDown: false) else {
+        let vk = CGKeyCode(keyCode)
+        guard let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: vk, keyDown: true),
+              let keyUp = CGEvent(keyboardEventSource: nil, virtualKey: vk, keyDown: false) else {
             throw HelperError.unsupportedInput(kind)
         }
-        let flags = CGEventFlags(rawValue: UInt64(modifiers))
+        let rawFlags = CGEventFlags(rawValue: UInt64(modifiers))
+        let flags = remoteModifiers.updateForKeyEvent(keyCode: vk, isDown: isDown, rawFlags: rawFlags)
         let event = isDown ? keyDown : keyUp
         event.flags = flags
         markSynthetic(event)
         event.post(tap: .cghidEventTap)
-        Logger.input("injected \(kind) key_code=\(keyCode) modifiers=\(modifiers)")
+        Logger.input("injected \(kind) key_code=\(keyCode) modifiers=\(flags.rawValue)")
     }
 
     private static func mouseMoveType(button: String?) -> CGEventType {
