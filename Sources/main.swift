@@ -41,6 +41,7 @@ struct InputPayload: Codable {
     let text: String?
     let button: String?
     let pressed: Bool?
+    var click_count: Int64? = nil
 }
 
 struct AckPayload: Decodable {
@@ -1170,27 +1171,27 @@ final class EventTapRunner: @unchecked Sendable {
             return nil
         case .leftMouseDown:
             moveCoalescer.flush()
-            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, x: nil, y: nil, key_code: nil, modifiers: nil, text: nil, button: "left", pressed: true))
+            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, x: nil, y: nil, key_code: nil, modifiers: nil, text: nil, button: "left", pressed: true, click_count: event.getIntegerValueField(.mouseEventClickState)))
             return nil
         case .leftMouseUp:
             moveCoalescer.flush()
-            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, x: nil, y: nil, key_code: nil, modifiers: nil, text: nil, button: "left", pressed: false))
+            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, x: nil, y: nil, key_code: nil, modifiers: nil, text: nil, button: "left", pressed: false, click_count: event.getIntegerValueField(.mouseEventClickState)))
             return nil
         case .rightMouseDown:
             moveCoalescer.flush()
-            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, x: nil, y: nil, key_code: nil, modifiers: nil, text: nil, button: "right", pressed: true))
+            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, x: nil, y: nil, key_code: nil, modifiers: nil, text: nil, button: "right", pressed: true, click_count: event.getIntegerValueField(.mouseEventClickState)))
             return nil
         case .rightMouseUp:
             moveCoalescer.flush()
-            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, x: nil, y: nil, key_code: nil, modifiers: nil, text: nil, button: "right", pressed: false))
+            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, x: nil, y: nil, key_code: nil, modifiers: nil, text: nil, button: "right", pressed: false, click_count: event.getIntegerValueField(.mouseEventClickState)))
             return nil
         case .otherMouseDown:
             moveCoalescer.flush()
-            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, x: nil, y: nil, key_code: nil, modifiers: nil, text: nil, button: buttonName(for: type, event: event), pressed: true))
+            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, x: nil, y: nil, key_code: nil, modifiers: nil, text: nil, button: buttonName(for: type, event: event), pressed: true, click_count: event.getIntegerValueField(.mouseEventClickState)))
             return nil
         case .otherMouseUp:
             moveCoalescer.flush()
-            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, x: nil, y: nil, key_code: nil, modifiers: nil, text: nil, button: buttonName(for: type, event: event), pressed: false))
+            client.sendInput(InputPayload(kind: "mouse_button", dx: nil, dy: nil, x: nil, y: nil, key_code: nil, modifiers: nil, text: nil, button: buttonName(for: type, event: event), pressed: false, click_count: event.getIntegerValueField(.mouseEventClickState)))
             return nil
         case .scrollWheel:
             moveCoalescer.flush()
@@ -1503,7 +1504,7 @@ enum InputInjector {
         case "mouse_move_abs":
             try injectMouseMoveAbs(x: input.x ?? 0, y: input.y ?? 0, button: input.button)
         case "mouse_button":
-            try injectMouseButton(button: input.button ?? "left", pressed: input.pressed ?? false)
+            try injectMouseButton(button: input.button ?? "left", pressed: input.pressed ?? false, clickCount: input.click_count ?? 1)
         case "scroll":
             try injectScroll(dx: input.dx ?? 0, dy: input.dy ?? 0)
         case "key_tap":
@@ -1546,7 +1547,7 @@ enum InputInjector {
         event.post(tap: .cghidEventTap)
     }
 
-    private static func injectMouseButton(button: String, pressed: Bool) throws {
+    private static func injectMouseButton(button: String, pressed: Bool, clickCount: Int64) throws {
         let probe = CGEvent(source: nil)
         let location = probe?.location ?? .zero
         let activeFlags = remoteModifiers.currentFlags()
@@ -1562,6 +1563,7 @@ enum InputInjector {
         guard let event = CGEvent(mouseEventSource: nil, mouseType: mouseType, mouseCursorPosition: location, mouseButton: mouseButton) else {
             throw HelperError.unsupportedInput("mouse_button")
         }
+        event.setIntegerValueField(.mouseEventClickState, value: max(1, clickCount))
         event.flags = activeFlags
         markSynthetic(event)
         event.post(tap: .cghidEventTap)
