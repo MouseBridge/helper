@@ -8,12 +8,23 @@
 - 上报热键、边缘切换、输入事件给 daemon
 - 把远端输入注入到当前 macOS 会话
 
-## 构建
+## 构建与代码签名
 
 ```bash
 cd helper
-swift build
+make
 ```
+
+> **提示（避免辅助功能权限每次失效）**：
+> macOS 辅助功能（Accessibility）权限是基于代码签名 Designated Requirement 绑定的。
+> 使用 `make` 会自动调用签名工具签署固定的 `MouseBridge Dev SelfSigned` 证书和 `com.mousebridge.helper` Bundle Identifier。
+> 这样即使修改代码重新编译，macOS 也不会判定权限失效，**只需在系统设置中授权一次即可永久有效**。
+>
+> 如果需要纯手工编译，可执行：
+> ```bash
+> swift build
+> ../scripts/sign-binary.sh .build/debug/mousebridge-helper com.mousebridge.helper
+> ```
 
 ## 直接运行
 
