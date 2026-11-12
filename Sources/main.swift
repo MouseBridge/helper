@@ -88,24 +88,37 @@ final class LocalCursorFreezeController: @unchecked Sendable {
     static let shared = LocalCursorFreezeController()
     private let lock = NSLock()
     private var frozen = false
+    private var cursorHidden = false
 
     func sync(shouldFreeze: Bool) {
         lock.lock()
         defer { lock.unlock() }
         if shouldFreeze && !frozen {
             CGAssociateMouseAndMouseCursorPosition(boolean_t(0))
+            if !cursorHidden {
+                CGDisplayHideCursor(kCGNullDirectDisplay)
+                cursorHidden = true
+            }
             frozen = true
-            Logger.log("local cursor movement frozen while controlling remote device")
+            Logger.log("local cursor movement frozen and hidden while controlling remote device")
         } else if !shouldFreeze && frozen {
+            if cursorHidden {
+                CGDisplayShowCursor(kCGNullDirectDisplay)
+                cursorHidden = false
+            }
             CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
             frozen = false
-            Logger.log("local cursor movement restored to host")
+            Logger.log("local cursor movement and visibility restored to host")
         }
     }
 
     func forceRestore() {
         lock.lock()
         defer { lock.unlock() }
+        if cursorHidden {
+            CGDisplayShowCursor(kCGNullDirectDisplay)
+            cursorHidden = false
+        }
         CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
         if frozen {
             frozen = false
@@ -1378,6 +1391,233 @@ final class RemoteModifierTracker: @unchecked Sendable {
     }
 }
 
+final class EnlargedPointerView: NSView {
+    override var isFlipped: Bool {
+        return false
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+
+        let hx: CGFloat = 14
+        let hy: CGFloat = 114
+
+        // 1. Radar glow ring centered around the cursor hotspot
+        context.saveGState()
+        let ringRadius: CGFloat = 18
+        let ringRect = NSRect(x: hx - ringRadius, y: hy - ringRadius, width: ringRadius * 2, height: ringRadius * 2)
+        let ringPath = NSBezierPath(ovalIn: ringRect)
+        NSColor.systemTeal.withAlphaComponent(0.65).setStroke()
+        ringPath.lineWidth = 2.5
+        ringPath.stroke()
+        context.restoreGState()
+
+        // 2. Drop shadow for high visibility on both light and dark screens
+        context.saveGState()
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.55)
+        shadow.shadowOffset = NSSize(width: 0, height: -3)
+        shadow.shadowBlurRadius = 5.0
+        shadow.set()
+
+        // 3. Magnified classic macOS cursor arrow (~3x scale)
+        let path = NSBezierPath()
+        path.move(to: NSPoint(x: hx, y: hy))
+        path.line(to: NSPoint(x: hx, y: hy - 52))
+        path.line(to: NSPoint(x: hx + 14, y: hy - 38))
+        path.line(to: NSPoint(x: hx + 28, y: hy - 66))
+        path.line(to: NSPoint(x: hx + 36, y: hy - 62))
+        path.line(to: NSPoint(x: hx + 22, y: hy - 34))
+        path.line(to: NSPoint(x: hx + 38, y: hy - 34))
+        path.close()
+
+        NSColor.white.setFill()
+        path.fill()
+        context.restoreGState()
+
+        // 4. Sharp black border
+        let strokePath = path.copy() as! NSBezierPath
+        NSColor.black.setStroke()
+        strokePath.lineWidth = 3.0
+        strokePath.lineJoinStyle = .miter
+        strokePath.stroke()
+    }
+}
+
+@MainActor
+final class LocatePointerOverlayController {
+    static let shared = LocatePointerOverlayController()
+
+    private var panel: NSPanel?
+    private var hideTimer: Timer?
+    private(set) var isVisible = false
+
+    private init() {}
+
+    private func setupPanelIfNeeded() {
+        guard panel == nil else { return }
+
+        let panelSize: CGFloat = 128
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: panelSize, height: panelSize),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.ignoresMouseEvents = true
+        panel.level = .screenSaver
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        panel.contentView = EnlargedPointerView(frame: NSRect(x: 0, y: 0, width: panelSize, height: panelSize))
+        self.panel = panel
+    }
+
+    func show(at cgLocation: CGPoint) {
+        setupPanelIfNeeded()
+        guard let panel = panel else { return }
+
+        updatePanelOrigin(panel: panel, cgLocation: cgLocation)
+        hideTimer?.invalidate()
+
+        if !isVisible {
+            isVisible = true
+            panel.alphaValue = 1.0
+            panel.orderFrontRegardless()
+            Logger.log("locate pointer overlay activated at (\(Int(cgLocation.x)), \(Int(cgLocation.y)))")
+        }
+
+        hideTimer = Timer.scheduledTimer(withTimeInterval: 0.8, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.fadeOut()
+            }
+        }
+    }
+
+    func updatePosition(_ cgLocation: CGPoint) {
+        guard isVisible, let panel = panel else { return }
+        updatePanelOrigin(panel: panel, cgLocation: cgLocation)
+
+        hideTimer?.invalidate()
+        hideTimer = Timer.scheduledTimer(withTimeInterval: 0.8, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.fadeOut()
+            }
+        }
+    }
+
+    func dismissImmediately() {
+        guard isVisible else { return }
+        hideTimer?.invalidate()
+        hideTimer = nil
+        fadeOut()
+    }
+
+    private func fadeOut() {
+        guard isVisible, let panel = panel else { return }
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0.2
+            panel.animator().alphaValue = 0.0
+        }, completionHandler: { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self = self else { return }
+                if panel.alphaValue == 0.0 {
+                    panel.orderOut(nil)
+                    self.isVisible = false
+                }
+            }
+        })
+    }
+
+    private func updatePanelOrigin(panel: NSPanel, cgLocation: CGPoint) {
+        guard let primaryScreen = NSScreen.screens.first else { return }
+        let primaryHeight = primaryScreen.frame.height
+        let cocoaX = cgLocation.x
+        let cocoaY = primaryHeight - cgLocation.y
+
+        let hotspotOffsetX: CGFloat = 14
+        let hotspotOffsetY: CGFloat = 114
+
+        let originX = cocoaX - hotspotOffsetX
+        let originY = cocoaY - hotspotOffsetY
+        panel.setFrameOrigin(NSPoint(x: originX, y: originY))
+    }
+}
+
+final class MouseShakeDetector: @unchecked Sendable {
+    static let shared = MouseShakeDetector()
+
+    private let lock = NSLock()
+    private var lastDirection: Int = 0
+    private var strokeDistance: Double = 0
+    private var reversalTimes: [TimeInterval] = []
+    private var lastEventTime: TimeInterval = 0
+
+    func recordMovement(dx: Double, dy: Double, at location: CGPoint) {
+        let now = ProcessInfo.processInfo.systemUptime
+        let dt = now - lastEventTime
+        lastEventTime = now
+
+        if dt > 0.35 {
+            lock.lock()
+            strokeDistance = 0
+            lastDirection = 0
+            reversalTimes.removeAll()
+            lock.unlock()
+        }
+
+        let dominantDelta = abs(dx) >= abs(dy) ? dx : dy
+        guard abs(dominantDelta) >= 3.0 else {
+            DispatchQueue.main.async {
+                if LocatePointerOverlayController.shared.isVisible {
+                    LocatePointerOverlayController.shared.updatePosition(location)
+                }
+            }
+            return
+        }
+
+        let currentDirection = dominantDelta > 0 ? 1 : -1
+
+        lock.lock()
+        if lastDirection == 0 {
+            lastDirection = currentDirection
+            strokeDistance = abs(dominantDelta)
+        } else if lastDirection == currentDirection {
+            strokeDistance += abs(dominantDelta)
+        } else {
+            // Reversal detected
+            if strokeDistance >= 22.0 {
+                let windowStart = now - 0.6
+                reversalTimes.removeAll { $0 < windowStart }
+                reversalTimes.append(now)
+
+                if reversalTimes.count >= 3 {
+                    reversalTimes.removeAll()
+                    strokeDistance = 0
+                    lastDirection = 0
+                    lock.unlock()
+
+                    DispatchQueue.main.async {
+                        LocatePointerOverlayController.shared.show(at: location)
+                    }
+                    return
+                }
+            }
+            lastDirection = currentDirection
+            strokeDistance = abs(dominantDelta)
+        }
+        lock.unlock()
+
+        DispatchQueue.main.async {
+            if LocatePointerOverlayController.shared.isVisible {
+                LocatePointerOverlayController.shared.updatePosition(location)
+            }
+        }
+    }
+}
+
 enum InputInjector {
     private static let guardState = InjectionGuard()
     private static let captureSuppression = CaptureSuppressionState()
@@ -1515,6 +1755,11 @@ enum InputInjector {
             try injectKeyEvent(kind: "key_up", keyCode: input.key_code ?? 0, modifiers: input.modifiers ?? 0)
         case "text":
             try injectText(input.text ?? "")
+        case "locate_cursor":
+            let location = CGEvent(source: nil)?.location ?? .zero
+            DispatchQueue.main.async {
+                LocatePointerOverlayController.shared.show(at: location)
+            }
         default:
             throw HelperError.unsupportedInput(input.kind)
         }
@@ -1523,6 +1768,7 @@ enum InputInjector {
     private static func injectMouseMove(dx: Double, dy: Double, button: String?) throws {
         let location = CGEvent(source: nil)?.location ?? .zero
         let next = CGPoint(x: location.x + dx, y: location.y + dy)
+        MouseShakeDetector.shared.recordMovement(dx: dx, dy: dy, at: next)
         try injectMouseMove(to: next, dx: dx, dy: dy, kind: "mouse_move", button: button)
         Logger.input("injected mouse_move dx=\(dx) dy=\(dy) button=\(normalizedButton(button)) from=(\(location.x),\(location.y)) to=(\(next.x),\(next.y))")
     }
@@ -1530,6 +1776,7 @@ enum InputInjector {
     private static func injectMouseMoveAbs(x: Double, y: Double, button: String?) throws {
         let location = CGEvent(source: nil)?.location ?? .zero
         let next = CGPoint(x: x, y: y)
+        MouseShakeDetector.shared.recordMovement(dx: next.x - location.x, dy: next.y - location.y, at: next)
         try injectMouseMove(to: next, dx: next.x - location.x, dy: next.y - location.y, kind: "mouse_move_abs", button: button)
         Logger.input("injected mouse_move_abs x=\(x) y=\(y) button=\(normalizedButton(button)) from=(\(location.x),\(location.y)) to=(\(next.x),\(next.y))")
     }
@@ -1555,6 +1802,11 @@ enum InputInjector {
             let stuckFlags = systemFlags.subtracting(activeFlags)
             if !stuckFlags.isEmpty {
                 clearStuckSystemModifiers(stuckFlags: stuckFlags, activeFlags: activeFlags)
+            }
+        }
+        if pressed {
+            DispatchQueue.main.async {
+                LocatePointerOverlayController.shared.dismissImmediately()
             }
         }
         let mouseButton = cgMouseButton(for: button)
@@ -1630,6 +1882,11 @@ enum InputInjector {
         }
 
         let vk = CGKeyCode(keyCode)
+        if isDown {
+            DispatchQueue.main.async {
+                LocatePointerOverlayController.shared.dismissImmediately()
+            }
+        }
         guard let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: vk, keyDown: true),
               let keyUp = CGEvent(keyboardEventSource: nil, virtualKey: vk, keyDown: false) else {
             throw HelperError.unsupportedInput(kind)
@@ -1774,15 +2031,28 @@ func runHelper(dataDir: String) throws {
         eventTap.reenableIfNeeded()
     }
 
+    DispatchQueue.main.async {
+        NSApplication.shared.setActivationPolicy(.accessory)
+    }
+
     Logger.log("helper running")
     atexit {
+        DispatchQueue.main.async {
+            LocatePointerOverlayController.shared.dismissImmediately()
+        }
         LocalCursorFreezeController.shared.forceRestore()
     }
     signal(SIGTERM) { _ in
+        DispatchQueue.main.async {
+            LocatePointerOverlayController.shared.dismissImmediately()
+        }
         LocalCursorFreezeController.shared.forceRestore()
         exit(0)
     }
     signal(SIGINT) { _ in
+        DispatchQueue.main.async {
+            LocatePointerOverlayController.shared.dismissImmediately()
+        }
         LocalCursorFreezeController.shared.forceRestore()
         exit(0)
     }
