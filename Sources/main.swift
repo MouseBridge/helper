@@ -1574,63 +1574,62 @@ final class MouseShakeDetector: @unchecked Sendable {
         self.enabled = enabled
         self.sensitivity = sensitivity.lowercased()
 
+        var numericValue: Double?
         switch self.sensitivity {
         case "0", "disabled", "off":
-            self.enabled = false
-            self.sensitivity = "0"
-            minStrokeDistance = 65.0
-            minReversals = 5
-            minDominantDelta = 6.0
-            windowDuration = 0.65
-        case "1", "lowest", "very_low", "minimal":
-            self.sensitivity = "1"
-            minStrokeDistance = 140.0
-            minReversals = 7
-            minDominantDelta = 10.0
-            windowDuration = 0.75
-        case "2":
-            self.sensitivity = "2"
-            minStrokeDistance = 110.0
-            minReversals = 6
-            minDominantDelta = 8.5
-            windowDuration = 0.70
-        case "3", "low":
-            self.sensitivity = "3"
-            minStrokeDistance = 85.0
-            minReversals = 6
-            minDominantDelta = 7.0
-            windowDuration = 0.70
-        case "4", "medium", "standard", "normal":
-            self.sensitivity = "4"
-            minStrokeDistance = 65.0
-            minReversals = 5
-            minDominantDelta = 6.0
-            windowDuration = 0.65
-        case "5":
-            self.sensitivity = "5"
-            minStrokeDistance = 52.0
-            minReversals = 4
-            minDominantDelta = 5.5
-            windowDuration = 0.60
-        case "6", "high":
-            self.sensitivity = "6"
-            minStrokeDistance = 42.0
-            minReversals = 4
-            minDominantDelta = 4.5
-            windowDuration = 0.60
-        case "7":
-            self.sensitivity = "7"
-            minStrokeDistance = 34.0
-            minReversals = 3
-            minDominantDelta = 3.5
-            windowDuration = 0.60
-        case "8", "highest", "ultra_high", "very_high":
-            self.sensitivity = "8"
-            minStrokeDistance = 24.0
-            minReversals = 3
-            minDominantDelta = 2.5
-            windowDuration = 0.55
-        default: // fallback to 4 (standard)
+            numericValue = 0
+        case "lowest", "very_low", "minimal":
+            numericValue = 1
+        case "low":
+            numericValue = 3
+        case "medium", "standard", "normal":
+            numericValue = 4
+        case "high":
+            numericValue = 6
+        case "highest", "ultra_high", "very_high":
+            numericValue = 8
+        default:
+            numericValue = Double(self.sensitivity)
+        }
+
+        if let val = numericValue {
+            if val < 0.2 {
+                self.enabled = false
+                self.sensitivity = "0"
+                minStrokeDistance = 65.0
+                minReversals = 5
+                minDominantDelta = 6.0
+                windowDuration = 0.65
+            } else {
+                let clamped = min(max(val, 1.0), 8.0)
+                let keyframes: [(stroke: Double, reversals: Int, dominant: Double, window: TimeInterval)] = [
+                    (stroke: 140.0, reversals: 7, dominant: 10.0, window: 0.75), // 1
+                    (stroke: 110.0, reversals: 6, dominant: 8.5, window: 0.70),  // 2
+                    (stroke: 85.0,  reversals: 6, dominant: 7.0, window: 0.70),  // 3
+                    (stroke: 65.0,  reversals: 5, dominant: 6.0, window: 0.65),  // 4 (center standard)
+                    (stroke: 52.0,  reversals: 4, dominant: 5.5, window: 0.60),  // 5
+                    (stroke: 42.0,  reversals: 4, dominant: 4.5, window: 0.60),  // 6
+                    (stroke: 34.0,  reversals: 3, dominant: 3.5, window: 0.60),  // 7
+                    (stroke: 24.0,  reversals: 3, dominant: 2.5, window: 0.55),  // 8
+                ]
+                let idx = Int(clamped) - 1
+                if idx >= 7 {
+                    let k = keyframes[7]
+                    minStrokeDistance = k.stroke
+                    minReversals = k.reversals
+                    minDominantDelta = k.dominant
+                    windowDuration = k.window
+                } else {
+                    let t = clamped - Double(idx + 1)
+                    let k1 = keyframes[idx]
+                    let k2 = keyframes[idx + 1]
+                    minStrokeDistance = k1.stroke + (k2.stroke - k1.stroke) * t
+                    minReversals = t < 0.5 ? k1.reversals : k2.reversals
+                    minDominantDelta = k1.dominant + (k2.dominant - k1.dominant) * t
+                    windowDuration = k1.window + (k2.window - k1.window) * t
+                }
+            }
+        } else {
             self.sensitivity = "4"
             minStrokeDistance = 65.0
             minReversals = 5
