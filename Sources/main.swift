@@ -71,6 +71,8 @@ struct ConfigPushPayload: Decodable {
     let capture_enabled: Bool
     let mouse_speed: Double?
     let scroll_speed: Double?
+    let shake_to_locate_enabled: Bool?
+    let shake_to_locate_sensitivity: String?
 }
 
 struct ParsedHotkey {
@@ -158,6 +160,10 @@ final class HelperState: @unchecked Sendable {
         if let scrollSpeed = payload.scroll_speed, scrollSpeed > 0 {
             scrollSpeedValue = min(max(scrollSpeed, 0.2), 10.0)
         }
+        MouseShakeDetector.shared.configure(
+            enabled: payload.shake_to_locate_enabled ?? true,
+            sensitivity: payload.shake_to_locate_sensitivity ?? "medium"
+        )
         edgeTargets = payload.edge_targets
         if !daemonDeviceID.isEmpty && previousTarget != daemonDeviceID && activeTarget == daemonDeviceID {
             requireEdgeNeutral = true
@@ -1550,12 +1556,71 @@ final class MouseShakeDetector: @unchecked Sendable {
     static let shared = MouseShakeDetector()
 
     private let lock = NSLock()
+    private var enabled: Bool = true
+    private var sensitivity: String = "medium"
+    private var minStrokeDistance: Double = 45.0
+    private var minReversals: Int = 4
+    private var minDominantDelta: Double = 5.0
+    private var windowDuration: TimeInterval = 0.6
+
     private var lastDirection: Int = 0
     private var strokeDistance: Double = 0
     private var reversalTimes: [TimeInterval] = []
     private var lastEventTime: TimeInterval = 0
 
+    func configure(enabled: Bool, sensitivity: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        self.enabled = enabled
+        self.sensitivity = sensitivity.lowercased()
+
+        switch self.sensitivity {
+        case "low":
+            minStrokeDistance = 65.0
+            minReversals = 5
+            minDominantDelta = 6.0
+            windowDuration = 0.65
+        case "high":
+            minStrokeDistance = 28.0
+            minReversals = 3
+            minDominantDelta = 3.0
+            windowDuration = 0.6
+        case "off", "disabled":
+            self.enabled = false
+            minStrokeDistance = 45.0
+            minReversals = 4
+            minDominantDelta = 5.0
+            windowDuration = 0.6
+        default: // "medium"
+            minStrokeDistance = 45.0
+            minReversals = 4
+            minDominantDelta = 5.0
+            windowDuration = 0.6
+        }
+
+        strokeDistance = 0
+        lastDirection = 0
+        reversalTimes.removeAll()
+    }
+
     func recordMovement(dx: Double, dy: Double, at location: CGPoint) {
+        lock.lock()
+        let isDetectorEnabled = enabled
+        let currentMinDominant = minDominantDelta
+        let currentMinStroke = minStrokeDistance
+        let currentMinReversals = minReversals
+        let currentWindow = windowDuration
+        lock.unlock()
+
+        guard isDetectorEnabled else {
+            DispatchQueue.main.async {
+                if LocatePointerOverlayController.shared.isVisible {
+                    LocatePointerOverlayController.shared.updatePosition(location)
+                }
+            }
+            return
+        }
+
         let now = ProcessInfo.processInfo.systemUptime
         let dt = now - lastEventTime
         lastEventTime = now
@@ -1569,7 +1634,7 @@ final class MouseShakeDetector: @unchecked Sendable {
         }
 
         let dominantDelta = abs(dx) >= abs(dy) ? dx : dy
-        guard abs(dominantDelta) >= 3.0 else {
+        guard abs(dominantDelta) >= currentMinDominant else {
             DispatchQueue.main.async {
                 if LocatePointerOverlayController.shared.isVisible {
                     LocatePointerOverlayController.shared.updatePosition(location)
@@ -1588,12 +1653,12 @@ final class MouseShakeDetector: @unchecked Sendable {
             strokeDistance += abs(dominantDelta)
         } else {
             // Reversal detected
-            if strokeDistance >= 22.0 {
-                let windowStart = now - 0.6
+            if strokeDistance >= currentMinStroke {
+                let windowStart = now - currentWindow
                 reversalTimes.removeAll { $0 < windowStart }
                 reversalTimes.append(now)
 
-                if reversalTimes.count >= 3 {
+                if reversalTimes.count >= currentMinReversals {
                     reversalTimes.removeAll()
                     strokeDistance = 0
                     lastDirection = 0
