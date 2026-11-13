@@ -86,44 +86,115 @@ let emergencyReturnCombo = "ctrl+alt+escape"
 let emergencyReturnKeyCode = CGKeyCode(kVK_Escape)
 let emergencyReturnModifiers: CGEventFlags = [.maskControl, .maskAlternate]
 
+final class BlankCursorView: NSView {
+    private static let blankCursor: NSCursor = {
+        let img = NSImage(size: NSSize(width: 1, height: 1))
+        return NSCursor(image: img, hotSpot: .zero)
+    }()
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: BlankCursorView.blankCursor)
+    }
+}
+
+@MainActor
+final class BlankCursorOverlayController {
+    static let shared = BlankCursorOverlayController()
+    private var panel: NSPanel?
+
+    private func setupPanelIfNeeded() -> NSPanel {
+        if let existing = panel { return existing }
+        let p = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 80, height: 80),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        p.isOpaque = false
+        p.backgroundColor = .clear
+        p.hasShadow = false
+        p.level = .screenSaver
+        p.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+        let view = BlankCursorView(frame: NSRect(x: 0, y: 0, width: 80, height: 80))
+        p.contentView = view
+        self.panel = p
+        return p
+    }
+
+    func show(at cgLocation: CGPoint) {
+        let p = setupPanelIfNeeded()
+        guard let primaryScreen = NSScreen.screens.first else { return }
+        let primaryHeight = primaryScreen.frame.height
+        let cocoaX = cgLocation.x
+        let cocoaY = primaryHeight - cgLocation.y
+        p.setFrameOrigin(NSPoint(x: cocoaX - 40, y: cocoaY - 40))
+        p.orderFrontRegardless()
+        if let cv = p.contentView {
+            p.invalidateCursorRects(for: cv)
+        }
+    }
+
+    func hide() {
+        panel?.orderOut(nil)
+    }
+}
+
 final class LocalCursorFreezeController: @unchecked Sendable {
     static let shared = LocalCursorFreezeController()
     private let lock = NSLock()
     private var frozen = false
-    private var cursorHidden = false
+    private var frozenLocation: CGPoint = .zero
 
     func sync(shouldFreeze: Bool) {
         lock.lock()
-        defer { lock.unlock() }
         if shouldFreeze && !frozen {
-            CGAssociateMouseAndMouseCursorPosition(boolean_t(0))
-            if !cursorHidden {
-                CGDisplayHideCursor(kCGNullDirectDisplay)
-                cursorHidden = true
-            }
+            let currentLoc = CGEvent(source: nil)?.location ?? .zero
+            frozenLocation = currentLoc
             frozen = true
-            Logger.log("local cursor movement frozen and hidden while controlling remote device")
+            lock.unlock()
+
+            CGAssociateMouseAndMouseCursorPosition(boolean_t(0))
+            CGWarpMouseCursorPosition(currentLoc)
+
+            DispatchQueue.main.async {
+                BlankCursorOverlayController.shared.show(at: currentLoc)
+            }
+            Logger.log("local cursor movement pinned at (\(Int(currentLoc.x)), \(Int(currentLoc.y))) and hidden while controlling remote device")
         } else if !shouldFreeze && frozen {
-            if cursorHidden {
-                CGDisplayShowCursor(kCGNullDirectDisplay)
-                cursorHidden = false
+            frozen = false
+            lock.unlock()
+
+            DispatchQueue.main.async {
+                BlankCursorOverlayController.shared.hide()
             }
             CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
-            frozen = false
             Logger.log("local cursor movement and visibility restored to host")
+        } else {
+            lock.unlock()
+        }
+    }
+
+    func pinCursor() {
+        lock.lock()
+        let isFrozen = frozen
+        let loc = frozenLocation
+        lock.unlock()
+        if isFrozen {
+            CGWarpMouseCursorPosition(loc)
         }
     }
 
     func forceRestore() {
         lock.lock()
-        defer { lock.unlock() }
-        if cursorHidden {
-            CGDisplayShowCursor(kCGNullDirectDisplay)
-            cursorHidden = false
+        let wasFrozen = frozen
+        frozen = false
+        lock.unlock()
+
+        DispatchQueue.main.async {
+            BlankCursorOverlayController.shared.hide()
         }
         CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
-        if frozen {
-            frozen = false
+        if wasFrozen {
             Logger.log("local cursor movement force-restored to host")
         }
     }
@@ -1170,6 +1241,7 @@ final class EventTapRunner: @unchecked Sendable {
         }
 
         LocalCursorFreezeController.shared.sync(shouldFreeze: true)
+        LocalCursorFreezeController.shared.pinCursor()
 
         switch type {
         case .mouseMoved:
