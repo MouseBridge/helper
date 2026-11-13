@@ -1575,44 +1575,63 @@ final class MouseShakeDetector: @unchecked Sendable {
         self.sensitivity = sensitivity.lowercased()
 
         switch self.sensitivity {
-        case "lowest", "very_low", "minimal":
-            self.sensitivity = "lowest"
-            minStrokeDistance = 120.0
-            minReversals = 7
-            minDominantDelta = 9.0
-            windowDuration = 0.75
-        case "low":
-            self.sensitivity = "low"
-            minStrokeDistance = 90.0
-            minReversals = 6
-            minDominantDelta = 7.5
-            windowDuration = 0.70
-        case "medium", "standard", "normal":
-            self.sensitivity = "medium"
-            minStrokeDistance = 65.0
-            minReversals = 5
-            minDominantDelta = 6.0
-            windowDuration = 0.65
-        case "high":
-            self.sensitivity = "high"
-            minStrokeDistance = 45.0
-            minReversals = 4
-            minDominantDelta = 5.0
-            windowDuration = 0.60
-        case "highest", "ultra_high", "very_high":
-            self.sensitivity = "highest"
-            minStrokeDistance = 28.0
-            minReversals = 3
-            minDominantDelta = 3.0
-            windowDuration = 0.60
-        case "off", "disabled":
+        case "0", "disabled", "off":
             self.enabled = false
+            self.sensitivity = "0"
             minStrokeDistance = 65.0
             minReversals = 5
             minDominantDelta = 6.0
             windowDuration = 0.65
-        default: // "medium"
-            self.sensitivity = "medium"
+        case "1", "lowest", "very_low", "minimal":
+            self.sensitivity = "1"
+            minStrokeDistance = 140.0
+            minReversals = 7
+            minDominantDelta = 10.0
+            windowDuration = 0.75
+        case "2":
+            self.sensitivity = "2"
+            minStrokeDistance = 110.0
+            minReversals = 6
+            minDominantDelta = 8.5
+            windowDuration = 0.70
+        case "3", "low":
+            self.sensitivity = "3"
+            minStrokeDistance = 85.0
+            minReversals = 6
+            minDominantDelta = 7.0
+            windowDuration = 0.70
+        case "4", "medium", "standard", "normal":
+            self.sensitivity = "4"
+            minStrokeDistance = 65.0
+            minReversals = 5
+            minDominantDelta = 6.0
+            windowDuration = 0.65
+        case "5":
+            self.sensitivity = "5"
+            minStrokeDistance = 52.0
+            minReversals = 4
+            minDominantDelta = 5.5
+            windowDuration = 0.60
+        case "6", "high":
+            self.sensitivity = "6"
+            minStrokeDistance = 42.0
+            minReversals = 4
+            minDominantDelta = 4.5
+            windowDuration = 0.60
+        case "7":
+            self.sensitivity = "7"
+            minStrokeDistance = 34.0
+            minReversals = 3
+            minDominantDelta = 3.5
+            windowDuration = 0.60
+        case "8", "highest", "ultra_high", "very_high":
+            self.sensitivity = "8"
+            minStrokeDistance = 24.0
+            minReversals = 3
+            minDominantDelta = 2.5
+            windowDuration = 0.55
+        default: // fallback to 4 (standard)
+            self.sensitivity = "4"
             minStrokeDistance = 65.0
             minReversals = 5
             minDominantDelta = 6.0
