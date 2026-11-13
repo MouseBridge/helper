@@ -1558,10 +1558,10 @@ final class MouseShakeDetector: @unchecked Sendable {
     private let lock = NSLock()
     private var enabled: Bool = true
     private var sensitivity: String = "medium"
-    private var minStrokeDistance: Double = 45.0
-    private var minReversals: Int = 4
-    private var minDominantDelta: Double = 5.0
-    private var windowDuration: TimeInterval = 0.6
+    private var minStrokeDistance: Double = 65.0
+    private var minReversals: Int = 5
+    private var minDominantDelta: Double = 6.0
+    private var windowDuration: TimeInterval = 0.65
 
     private var lastDirection: Int = 0
     private var strokeDistance: Double = 0
@@ -1575,27 +1575,48 @@ final class MouseShakeDetector: @unchecked Sendable {
         self.sensitivity = sensitivity.lowercased()
 
         switch self.sensitivity {
+        case "lowest", "very_low", "minimal":
+            self.sensitivity = "lowest"
+            minStrokeDistance = 120.0
+            minReversals = 7
+            minDominantDelta = 9.0
+            windowDuration = 0.75
         case "low":
+            self.sensitivity = "low"
+            minStrokeDistance = 90.0
+            minReversals = 6
+            minDominantDelta = 7.5
+            windowDuration = 0.70
+        case "medium", "standard", "normal":
+            self.sensitivity = "medium"
             minStrokeDistance = 65.0
             minReversals = 5
             minDominantDelta = 6.0
             windowDuration = 0.65
         case "high":
+            self.sensitivity = "high"
+            minStrokeDistance = 45.0
+            minReversals = 4
+            minDominantDelta = 5.0
+            windowDuration = 0.60
+        case "highest", "ultra_high", "very_high":
+            self.sensitivity = "highest"
             minStrokeDistance = 28.0
             minReversals = 3
             minDominantDelta = 3.0
-            windowDuration = 0.6
+            windowDuration = 0.60
         case "off", "disabled":
             self.enabled = false
-            minStrokeDistance = 45.0
-            minReversals = 4
-            minDominantDelta = 5.0
-            windowDuration = 0.6
+            minStrokeDistance = 65.0
+            minReversals = 5
+            minDominantDelta = 6.0
+            windowDuration = 0.65
         default: // "medium"
-            minStrokeDistance = 45.0
-            minReversals = 4
-            minDominantDelta = 5.0
-            windowDuration = 0.6
+            self.sensitivity = "medium"
+            minStrokeDistance = 65.0
+            minReversals = 5
+            minDominantDelta = 6.0
+            windowDuration = 0.65
         }
 
         strokeDistance = 0
